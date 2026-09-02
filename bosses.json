@@ -1,0 +1,5 @@
+{
+  "오만의탑": {"type": "cycle", "anchor": "2026-09-02 09:30", "active_min": 90, "rest_min": 120},
+  "라스타바드4층": {"type": "cycle", "anchor": "2026-09-02 02:00", "active_min": 120, "rest_min": 150},
+  "본토(메인랜드)": {"type": "cycle", "anchor": "2026-09-02 02:30", "active_min": 150, "rest_min": 90}
+}
