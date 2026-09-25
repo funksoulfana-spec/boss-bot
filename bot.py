@@ -50,6 +50,10 @@ ROLE_ID = _int_env("ROLE_ID")
 GUILD_ID = _int_env("GUILD_ID")
 PRE_ALERT_MIN = _int_env("PRE_ALERT_MIN", 5)   # N분 전 예고 (0이면 끔)
 DATA_FILE = os.environ.get("DATA_FILE", "bosses.json")
+# 사이트 자동 보정 (l1justice 보스 상태 JSON) — 0 이면 끔
+AUTO_SYNC = os.environ.get("AUTO_SYNC", "1").strip() != "0"
+STATE_URL = os.environ.get("STATE_URL", "https://l1justice.com/lineage/database/bosses/state/")
+SYNC_TOLERANCE_MIN = 2   # 예측과 실제 시작이 이 분 이상 차이 나면 기준시각 보정
 try:
     TZ = ZoneInfo(os.environ.get("TZ", "Asia/Seoul"))
 except Exception:
@@ -203,6 +207,9 @@ class BossBot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.sent_keys: set[str] = set()
+        self.prev_states: dict[str, str] | None = None   # 사이트 직전 상태
+        self.last_sync: dict[str, datetime] = {}          # 보스별 마지막 자동보정 시각
+        self.site_ok: bool | None = None
 
     async def setup_hook(self):
         if GUILD_ID:
@@ -212,6 +219,8 @@ class BossBot(discord.Client):
         else:
             await self.tree.sync()
         self.ticker.start()
+        if AUTO_SYNC:
+            self.site_poller.start()
 
     async def on_ready(self):
         log.info("로그인 완료: %s (보스 %d개)", self.user, len(bosses))
@@ -237,6 +246,73 @@ class BossBot(discord.Client):
     async def before_ticker(self):
         await self.wait_until_ready()
 
+    # ───────── 사이트 자동 보정: 60초마다 보스 상태 확인 ─────────
+    @tasks.loop(seconds=60)
+    async def site_poller(self):
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                async with s.get(STATE_URL, headers={"User-Agent": "boss-alarm-bot"}) as r:
+                    if r.status != 200:
+                        raise RuntimeError(f"HTTP {r.status}")
+                    states = await r.json(content_type=None)
+            if self.site_ok is not True:
+                log.info("사이트 상태 수신 OK (%d개)", len(states))
+            self.site_ok = True
+        except Exception as e:
+            if self.site_ok is not False:
+                log.warning("사이트 상태 수신 실패: %s", e)
+            self.site_ok = False
+            return
+
+        now = datetime.now(TZ).replace(second=0, microsecond=0)
+        prev = self.prev_states
+        self.prev_states = states
+        if prev is None:
+            return  # 첫 수신은 기준값만 저장
+
+        for name, info in list(bosses.items()):
+            ids = [str(i) for i in info.get("spawn_ids", [])]
+            if info.get("type") != "cycle" or not ids:
+                continue
+            # 비활성/죽음 → 활성 으로 바뀐 보스가 있으면 = 보스타임 시작
+            respawned = [i for i in ids if states.get(i) == "ACTIVE" and prev.get(i, "INACTIVE") != "ACTIVE"]
+            if not respawned:
+                continue
+            last = self.last_sync.get(name)
+            if last and now - last < timedelta(minutes=info["active_min"]):
+                continue  # 같은 보스타임 안에서 중복 감지 방지
+            self.last_sync[name] = now
+            await self._on_detected_start(name, info, now)
+
+    @site_poller.before_loop
+    async def before_poller(self):
+        await self.wait_until_ready()
+
+    async def _on_detected_start(self, name: str, info: dict, detected: datetime):
+        """사이트에서 시작 감지 → 예측과 다르면 기준시각 보정 + 시작 알림"""
+        anchor = datetime.strptime(info["anchor"], "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        cycle = timedelta(minutes=info["active_min"] + info["rest_min"])
+        k = round((detected - anchor) / cycle)
+        predicted = anchor + cycle * k
+        diff_min = abs((detected - predicted).total_seconds()) / 60
+        if diff_min <= SYNC_TOLERANCE_MIN:
+            log.info("자동확인: %s 예측대로 시작 (%s)", name, detected.strftime("%H:%M"))
+            return
+        info["anchor"] = detected.strftime("%Y-%m-%d %H:%M")
+        save_bosses(bosses)
+        log.info("자동보정: %s 기준 %s → %s", name, predicted.strftime("%H:%M"), detected.strftime("%H:%M"))
+        # 새 기준으로 알림 (틱커와 중복 안 되게 키 등록)
+        key = f"{detected:%Y%m%d%H%M}|{name}|start"
+        if key not in self.sent_keys:
+            self.sent_keys.add(key)
+            await self.announce(name, "start", detected, pre=False)
+        try:
+            channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
+            await channel.send(f"🔄 **{name}** 시간표 자동 보정: 예상 {predicted:%H:%M} → 실제 {detected:%H:%M} (사이트 기준)")
+        except Exception as e:
+            log.error("보정 안내 전송 실패: %s", e)
+
     async def _send_once(self, key: str, name: str, kind: str, ev_time: datetime, pre: bool):
         if key in self.sent_keys:
             return
@@ -253,7 +329,8 @@ class BossBot(discord.Client):
                 msg = f"{mention}⏰ **{name}** 시작 {PRE_ALERT_MIN}분 전! ({t})"
             else:
                 extra = f" — {fmt_dur(info['active_min'])} 동안 진행" if info.get("type") == "cycle" else ""
-                msg = f"{mention}🔥 **{name}** 시작! ({t}){extra}"
+                desc = f"\n└ {info['desc']}" if info.get("desc") else ""
+                msg = f"{mention}🔥 **{name}** 시작! ({t}){extra}{desc}"
         else:
             if pre:
                 msg = f"{mention}⌛ **{name}** 종료 {PRE_ALERT_MIN}분 전! ({t})"
@@ -372,6 +449,27 @@ async def list_bosses(interaction: discord.Interaction):
     rows.sort(key=lambda r: r[0])
     body = "\n".join(r[1] for r in rows)
     await interaction.response.send_message(f"📋 **보스 시간표** ({now:%H:%M} 기준)\n```\n{body}\n```")
+
+
+@client.tree.command(name="사이트상태", description="l1justice 사이트 기준 보스 그룹 실시간 상태")
+async def site_status(interaction: discord.Interaction):
+    states = client.prev_states
+    if not AUTO_SYNC:
+        await interaction.response.send_message("자동 보정이 꺼져 있어요 (AUTO_SYNC=0).", ephemeral=True)
+        return
+    if not states:
+        await interaction.response.send_message("아직 사이트 정보를 못 받았어요. 1분 뒤 다시 해보세요.", ephemeral=True)
+        return
+    lines = ["🌐 **사이트 실시간 상태** (ACTIVE / 전체)", "```"]
+    for name, info in bosses.items():
+        ids = [str(i) for i in info.get("spawn_ids", [])]
+        if not ids:
+            continue
+        act = sum(1 for i in ids if states.get(i) == "ACTIVE")
+        lines.append(f"{name:<10} ACTIVE {act}/{len(ids)}")
+    lines.append("```")
+    lines.append("※ 보스가 INACTIVE→ACTIVE 로 바뀌는 순간을 보스타임 시작으로 보고 자동 보정해요.")
+    await interaction.response.send_message("\n".join(lines))
 
 
 @client.tree.command(name="테스트알림", description="알림 채널/역할 멘션 테스트")
