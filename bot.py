@@ -53,7 +53,19 @@ DATA_FILE = os.environ.get("DATA_FILE", "bosses.json")
 # 사이트 자동 보정 (l1justice 보스 상태 JSON) — 0 이면 끔
 AUTO_SYNC = os.environ.get("AUTO_SYNC", "1").strip() != "0"
 STATE_URL = os.environ.get("STATE_URL", "https://l1justice.com/lineage/database/bosses/state/")
+HOME_URL = os.environ.get("HOME_URL", "https://l1justice.com/lineage/")   # "Server Status: Online/Offline" 표시
+
+
+def parse_server_status(html: str) -> bool | None:
+    """홈페이지 HTML 에서 서버 상태 읽기. Online=True, Offline=False, 못 찾으면 None"""
+    import re
+    text = re.sub(r"<[^>]+>", " ", html)
+    m = re.search(r"Server\s*Status\s*:\s*(Online|Offline)", text, re.I)
+    if not m:
+        return None
+    return m.group(1).lower() == "online"
 SYNC_TOLERANCE_MIN = 2   # 예측과 실제 시작이 이 분 이상 차이 나면 기준시각 보정
+MASS_FLIP = 45           # 한 번에 이만큼 넘게 ACTIVE 로 바뀌면 = 서버 재시작(보스 일괄 복구)으로 판단
 try:
     TZ = ZoneInfo(os.environ.get("TZ", "Asia/Seoul"))
 except Exception:
@@ -210,6 +222,7 @@ class BossBot(discord.Client):
         self.prev_states: dict[str, str] | None = None   # 사이트 직전 상태
         self.last_sync: dict[str, datetime] = {}          # 보스별 마지막 자동보정 시각
         self.site_ok: bool | None = None
+        self.server_online: bool | None = None           # 리니지 서버 온라인 여부
 
     async def setup_hook(self):
         if GUILD_ID:
@@ -228,7 +241,11 @@ class BossBot(discord.Client):
     @tasks.loop(seconds=30)
     async def ticker(self):
         now = datetime.now(TZ).replace(second=0, microsecond=0)
+        if self.server_online is False:
+            return  # 서버 오프라인 중엔 알림 멈춤
         for name, info in list(bosses.items()):
+            if info.get("unsynced"):
+                continue  # 서버 재시작 후 아직 실제 시작 확인 전 → 틀린 알림 방지
             try:
                 for ev_time, _, kind in upcoming_events(name, info, now, horizon_min=max(PRE_ALERT_MIN, 1)):
                     # 본 알림
@@ -250,6 +267,35 @@ class BossBot(discord.Client):
     @tasks.loop(seconds=60)
     async def site_poller(self):
         import aiohttp
+        # 1) 서버 온라인/오프라인 확인
+        status = None
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+                async with s.get(HOME_URL, headers={"User-Agent": "boss-alarm-bot"}) as r:
+                    if r.status == 200:
+                        status = parse_server_status(await r.text())
+        except Exception as e:
+            log.warning("서버 상태 확인 실패: %s", e)
+        if status is False:
+            if self.server_online is not False:
+                self.server_online = False
+                for info in bosses.values():
+                    if info.get("type") == "cycle":
+                        info["unsynced"] = True
+                save_bosses(bosses)
+                log.info("서버 오프라인 감지")
+                await self._notify("⛔ 리니지 서버 오프라인 감지 — 보스 알림을 잠시 멈출게요.")
+            return  # 오프라인 중 사이트 보스 상태는 멈춰 있으므로 무시
+        if status is True and self.server_online is False:
+            self.server_online = True
+            self.last_sync.clear()
+            self.prev_states = None   # 재시작 후 첫 상태를 새 기준값으로
+            log.info("서버 온라인 복귀")
+            await self._notify("✅ 서버 온라인! 보스가 실제로 뜨는 순간 사이클별로 시간표를 자동으로 맞출게요. (그 전까지 해당 알림은 쉬어요)")
+        elif status is True:
+            self.server_online = True
+
+        # 2) 보스 상태 확인
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
                 async with s.get(STATE_URL, headers={"User-Agent": "boss-alarm-bot"}) as r:
@@ -270,6 +316,14 @@ class BossBot(discord.Client):
         self.prev_states = states
         if prev is None:
             return  # 첫 수신은 기준값만 저장
+
+        # 서버 재시작 감지: 사이트 전체에서 한꺼번에 많이 ACTIVE 로 바뀌면 보스타임 시작이 아님
+        flipped = sum(1 for k, v in states.items() if v == "ACTIVE" and prev.get(k, "INACTIVE") != "ACTIVE")
+        if flipped >= MASS_FLIP:
+            self.last_sync.clear()   # 중복방지 기록 초기화 → 진짜 보스타임은 놓치지 않게
+            log.info("서버 재시작으로 판단 (%d개 동시 ACTIVE) — 이번 변화는 무시", flipped)
+            await self._notify("🔌 서버 재시작 감지! 보스타임이 실제로 열리는 순간 시간표를 자동으로 맞출게요.")
+            return
 
         for name, info in list(bosses.items()):
             ids = [str(i) for i in info.get("spawn_ids", [])]
@@ -296,6 +350,16 @@ class BossBot(discord.Client):
         k = round((detected - anchor) / cycle)
         predicted = anchor + cycle * k
         diff_min = abs((detected - predicted).total_seconds()) / 60
+        if info.pop("unsynced", None):
+            info["anchor"] = detected.strftime("%Y-%m-%d %H:%M")
+            save_bosses(bosses)
+            log.info("재시작 후 확정: %s %s", name, detected.strftime("%H:%M"))
+            key = f"{detected:%Y%m%d%H%M}|{name}|start"
+            if key not in self.sent_keys:
+                self.sent_keys.add(key)
+                await self.announce(name, "start", detected, pre=False)
+            await self._notify(f"📌 **{name}** 서버 재시작 후 첫 보스타임 확인 ({detected:%H:%M}) → 시간표 확정!")
+            return
         if diff_min <= SYNC_TOLERANCE_MIN:
             log.info("자동확인: %s 예측대로 시작 (%s)", name, detected.strftime("%H:%M"))
             return
@@ -312,6 +376,13 @@ class BossBot(discord.Client):
             await channel.send(f"🔄 **{name}** 시간표 자동 보정: 예상 {predicted:%H:%M} → 실제 {detected:%H:%M} (사이트 기준)")
         except Exception as e:
             log.error("보정 안내 전송 실패: %s", e)
+
+    async def _notify(self, text: str):
+        try:
+            channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
+            await channel.send(text)
+        except Exception as e:
+            log.error("안내 전송 실패: %s", e)
 
     async def _send_once(self, key: str, name: str, kind: str, ev_time: datetime, pre: bool):
         if key in self.sent_keys:
@@ -404,6 +475,7 @@ async def reset_anchor(interaction: discord.Interaction, 이름: str, 시작시�
         await interaction.response.send_message("❌ 시작시각 형식이 이상해요.", ephemeral=True)
         return
     info["anchor"] = anchor.strftime("%Y-%m-%d %H:%M")
+    info.pop("unsynced", None)
     save_bosses(bosses)
     st, ns, _ = cycle_status(info, now)
     await interaction.response.send_message(f"🔧 **{이름}** 기준 시작 {anchor:%m/%d %H:%M} 으로 재설정 · 지금 {st} · 다음 시작 {ns:%H:%M}")
@@ -428,6 +500,9 @@ async def list_bosses(interaction: discord.Interaction):
     now = datetime.now(TZ)
     rows = []
     for name, info in bosses.items():
+        if info.get("type") == "cycle" and info.get("unsynced"):
+            rows.append((now, f"⏳ {name:<10} 서버 재시작 후 대기 · 보스 뜨면 자동 확정"))
+            continue
         if info.get("type") == "cycle":
             st, ns, ne = cycle_status(info, now)
             if st == "진행중":
