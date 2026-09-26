@@ -359,6 +359,7 @@ class BossBot(discord.Client):
         self.sent_keys: set[str] = set()
         self.prev_states: dict[str, str] | None = None   # 사이트 직전 상태
         self.last_sync: dict[str, datetime] = {}          # 보스별 마지막 자동보정 시각
+        self.flips: dict[str, dict[str, datetime]] = {}   # 사이클별 최근 ACTIVE 로 바뀐 보스와 시각
         self.site_ok: bool | None = None
         self.server_online: bool | None = None           # 리니지 서버 온라인 여부
         self.started = datetime.now(TZ)                  # 봇 켜진 시각 (이미 진행중인 타임은 골든 알림 생략)
@@ -471,15 +472,36 @@ class BossBot(discord.Client):
             ids = [str(i) for i in info.get("spawn_ids", [])]
             if info.get("type") != "cycle" or not ids:
                 continue
-            # 비활성/죽음 → 활성 으로 바뀐 보스가 있으면 = 보스타임 시작
-            respawned = [i for i in ids if states.get(i) == "ACTIVE" and prev.get(i, "INACTIVE") != "ACTIVE"]
-            if not respawned:
+            # 비활성/죽음 → 활성 으로 바뀐 보스 (최근 3분 동안 모아서 판단)
+            fl = self.flips.setdefault(name, {})
+            for i in ids:
+                if states.get(i) == "ACTIVE" and prev.get(i, "INACTIVE") != "ACTIVE":
+                    fl.setdefault(i, now)
+            for i, t in list(fl.items()):
+                if now - t > timedelta(minutes=3):
+                    fl.pop(i)
+            if not fl:
                 continue
+            # 이번 판단의 분모 = 3분 전 시점에 ACTIVE 가 아니던 보스 수
+            waiting = sum(1 for i in ids if prev.get(i, "INACTIVE") != "ACTIVE") + sum(1 for i in fl if prev.get(i) == "ACTIVE")
+            n = len(fl)
+            in_window = not info.get("unsynced") and cycle_status(info, now)[0] == "진행중"
+            if in_window:
+                # 예상 보스타임 진행 중엔 한두 마리 재등장(리스폰)으로 시간표를 바꾸지 않음
+                if n < max(2, (len(ids) + 1) // 2):
+                    log.info("보류: %s 진행중 %d마리만 ACTIVE 전환 %s (리스폰일 수 있어 3분간 더 봄)", name, n, sorted(fl))
+                    continue
+            elif n < max(min(2, len(ids)), (max(waiting, 1) + 1) // 2):
+                continue  # 아직 소수만 바뀜 → 조금 더 지켜봄 (3분 안에 절반 넘게 바뀌어야 시작으로 인정)
             last = self.last_sync.get(name)
             if last and now - last < timedelta(minutes=info["active_min"]):
+                fl.clear()
                 continue  # 같은 보스타임 안에서 중복 감지 방지
+            detected = min(fl.values())
+            log.info("보스타임 시작 감지: %s %d/%d마리 ACTIVE %s", name, n, len(ids), sorted(fl))
+            fl.clear()
             self.last_sync[name] = now
-            await self._on_detected_start(name, info, now)
+            await self._on_detected_start(name, info, detected)
 
     @site_poller.before_loop
     async def before_poller(self):
