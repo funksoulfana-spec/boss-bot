@@ -98,6 +98,10 @@ Procfile          Railway/Heroku 실행 명령
 - 데스나이트/에이션트자이언트는 사이트 번호를 `/보스번호` 로 등록해야 자동 학습돼요 (등록 전엔 초기값으로 알림).
 - 봇 켜기 전에 이미 시작한 보스타임은 골든 알림을 건너뛰고 다음 타임부터 보내요.
 - 보스타임은 항상 :00/:30 에 시작 → 자동보정·`/기준시각` 모두 :00/:30 으로 맞춰요 (첫 보스가 늦게 떠도 안 밀림).
+- 🔧 **자동 조정**: 보스마다 "최근 30판에 이 기준이었으면 실제로 몇 번 안 놓쳤나"를 되돌아봐서, 목표(`GOLDEN_RATE`)보다 덜 맞으면 계산 기준을 최대 +12%p 까지 자동으로 올림 (좋아지면 다시 내려옴). 조정 안내 메시지는 따로 안 보내고, 시작 알림의 골든 순서표에 ⬆ 표시 + `/골든타임` 표로 확인. 끄려면 `GOLDEN_AUTO=0`
+- 📊 **주간 요약**: 매주 월요일 12:00 에 보스별 출발 시각·자동 조정(⬆)·최근 적중·이번 주 봇 기록 수를 한 메시지로. 요일/시각 `GOLDEN_WEEKLY_DAY`(0=월~6=일) `GOLDEN_WEEKLY_HOUR`, 끄기 `GOLDEN_WEEKLY=0`
+- 🎯 출발 알림에도 자동으로 앞당겨진 보스는 ⬆ 표시
+- 보스별 목표 직접 지정: `/골든기준 이름:뱀파이어 확률:85`, 되돌리기 `확률:기본` (Volume 에 저장)
 - 환경변수: `GOLDEN_RATE`(90) `GOLDEN_RECENT`(60) `GOLDEN_PRE_MIN`(0=끔) `GOLDEN_GROUP_MIN`(3) `TRAVEL_LOW`(0) `TRAVEL_HIGH`(6)
 - 💾 재배포해도 학습 기록을 유지하려면 Railway **Volume** 을 `/data` 에 붙이고 변수 추가:
   `GOLDEN_LOG=/data/learned_kills.csv`, `GOLDEN_IDS_FILE=/data/golden_ids.json`, `DATA_FILE=/data/bosses.json`

@@ -228,7 +228,18 @@ def cycle_status(info: dict, now: datetime) -> tuple[str, datetime, datetime]:
 # 보스마다 "최근 GOLDEN_RECENT 건"만 써서 계산 → 요즘 빨리 잡히는 보스는 자동으로 골든타임이 당겨짐
 GOLDEN_SEED = os.environ.get("GOLDEN_SEED", "golden_seed.csv")
 GOLDEN_LOG = os.environ.get("GOLDEN_LOG", "learned_kills.csv")
-GOLDEN_RATE = _int_env("GOLDEN_RATE", 90) / 100                # 잡을 확률 목표 (기본 90%)
+GOLDEN_RATE = _int_env("GOLDEN_RATE", 90) / 100                # 잡을 확률 목표 (기본값, 보스별로 따로 정할 수 있음)
+# 보스별 기준 확률 (없는 보스는 GOLDEN_RATE). 최근 빨리 잡히는 보스는 높게 잡아 실제 적중률을 맞춤
+GOLDEN_RATE_DEFAULTS: dict[str, int] = {}   # 직접 고정하고 싶으면 {"뱀파이어": 90} 처럼 (보통은 자동조정에 맡김)
+# 자동 조정: 보스별로 "최근 GOLDEN_AUTO_CHECK 판에서 실제로 맞았는지" 되돌아보고,
+# 목표보다 덜 맞으면 계산 기준을 올려서 실제 적중률을 목표에 맞춤 (좋아지면 다시 내려옴)
+GOLDEN_AUTO = os.environ.get("GOLDEN_AUTO", "1").strip() != "0"
+GOLDEN_AUTO_CHECK = _int_env("GOLDEN_AUTO_CHECK", 30)   # 최근 몇 판으로 적중률 확인
+GOLDEN_AUTO_MAX = _int_env("GOLDEN_AUTO_MAX", 12)       # 목표보다 최대 몇 %p 까지 올릴지
+# 주간 요약: 매주 한 번 보스별 골든 기준 변화를 한 메시지로 (0=월 ... 6=일, 시각은 한국시간)
+GOLDEN_WEEKLY = os.environ.get("GOLDEN_WEEKLY", "1").strip() != "0"
+GOLDEN_WEEKLY_DAY = _int_env("GOLDEN_WEEKLY_DAY", 0)
+GOLDEN_WEEKLY_HOUR = _int_env("GOLDEN_WEEKLY_HOUR", 12)
 GOLDEN_PRE_MIN = _int_env("GOLDEN_PRE_MIN", 0)                  # 출발 몇 분 전 예고 (0=끔, 출발 신호만)
 GOLDEN_GROUP_MIN = _int_env("GOLDEN_GROUP_MIN", 3)              # 출발 시각이 이 분 안에 몰린 보스는 한 번에 묶어서 알림
 GOLDEN_RECENT = _int_env("GOLDEN_RECENT", 60)                   # 최근 몇 건으로 계산할지
@@ -252,6 +263,26 @@ GOLDEN_BOSSES = {
     "에이션트자이언트": ("아덴(본토)", 0, 0, 44),
 }
 GOLDEN_IDS_FILE = os.environ.get("GOLDEN_IDS_FILE", "golden_ids.json")   # /보스번호 로 넣은 번호 저장
+
+
+def _rates_path() -> str:
+    # 처치 기록(GOLDEN_LOG)과 같은 폴더(= Volume)에 저장 → 재배포해도 유지
+    return os.path.join(os.path.dirname(GOLDEN_LOG) or ".", "golden_rates.json")
+
+
+def boss_rates() -> dict[str, int]:
+    rates = dict(GOLDEN_RATE_DEFAULTS)
+    try:
+        if os.path.exists(_rates_path()):
+            with open(_rates_path(), encoding="utf-8") as f:
+                for k, v in json.load(f).items():
+                    if v is None:
+                        rates.pop(k, None)
+                    else:
+                        rates[k] = int(v)
+    except Exception as e:
+        log.warning("보스별 기준 읽기 실패: %s", e)
+    return rates
 
 
 def golden_ids() -> dict[str, int]:
@@ -287,6 +318,19 @@ def _read_kills(path: str) -> list[tuple[str, str, float]]:
     return out
 
 
+def _walk_hit(ms: list[float], rate: float, n_hist: int, check: int) -> float | None:
+    """과거 n_hist 판으로 예측 → 다음 판 결과 확인을 최근 check 판 반복한 실제 적중률"""
+    start = max(n_hist, len(ms) - check)
+    if len(ms) - start < 10:
+        return None
+    hit = 0
+    for i in range(start, len(ms)):
+        hist = sorted(ms[i - n_hist:i])
+        arrive = int(hist[min(int((1 - rate) * n_hist), n_hist - 1)])
+        hit += ms[i] >= arrive
+    return hit / (len(ms) - start)
+
+
 def load_golden() -> list[dict]:
     """보스별 골든타임 계산 (최근 GOLDEN_RECENT 건 기준)"""
     allk: dict[str, list[tuple[str, float]]] = {}
@@ -298,6 +342,7 @@ def load_golden() -> list[dict]:
                 if src == GOLDEN_LOG:
                     learned[name] = learned.get(name, 0) + 1
     out = []
+    rates = boss_rates()
     for name, (cyc, floor, _, _) in GOLDEN_BOSSES.items():
         rec = sorted(allk.get(name, []))[-GOLDEN_RECENT:]     # 시간순 → 최근 N건
         ks = sorted(m for _, m in rec)
@@ -305,8 +350,21 @@ def load_golden() -> list[dict]:
         g = {"name": name, "cycle": cyc, "floor": floor, "n": n, "learned": learned.get(name, 0)}
         if n:
             g["median_kill"] = int(ks[n // 2])
+        target = rates.get(name, round(GOLDEN_RATE * 100))
+        g["target"] = g["eff"] = target
+        chrono = [m for _, m in sorted(allk.get(name, []))]
+        if GOLDEN_AUTO and len(chrono) >= GOLDEN_RECENT + 10:
+            g["recent_hit"] = round(100 * _walk_hit(chrono, target / 100, GOLDEN_RECENT, GOLDEN_AUTO_CHECK))
+            cap = min(97, target + GOLDEN_AUTO_MAX)
+            g["eff"] = cap
+            for r in range(target, cap + 1):
+                h = _walk_hit(chrono, r / 100, GOLDEN_RECENT, GOLDEN_AUTO_CHECK)
+                if h is not None and h >= target / 100:
+                    g["eff"] = r
+                    break
+        rate = g["eff"] / 100
         if n >= GOLDEN_MIN_SAMPLES:
-            k = int((1 - GOLDEN_RATE) * n)          # 도착 전에 이미 잡힌 판 수 (허용치)
+            k = int((1 - rate) * n)                 # 도착 전에 이미 잡힌 판 수 (허용치)
             arrive = int(ks[min(k, n - 1)])
             travel = _travel(name)
             g.update(arrive=arrive, travel=travel, depart=max(0, arrive - travel),
@@ -314,6 +372,15 @@ def load_golden() -> list[dict]:
         out.append(g)
     out.sort(key=lambda g: (g["floor"] == 0, g["floor"], g["name"]))
     return out
+
+
+def already_recorded(name: str, start: datetime) -> bool:
+    import csv
+    if not os.path.exists(GOLDEN_LOG):
+        return False
+    key = start.strftime("%Y-%m-%d %H:%M")
+    with open(GOLDEN_LOG, encoding="utf-8-sig") as f:
+        return any(r.get("보스") == name and r.get("보스타임시작") == key for r in csv.DictReader(f))
 
 
 def record_kill(name: str, start: datetime, killed: datetime) -> float:
@@ -397,8 +464,14 @@ class BossBot(discord.Client):
             except Exception as e:
                 log.error("이벤트 계산 실패 (%s): %s", name, e)
         await self.golden_tick(now)
+        try:
+            await self.weekly_tick(now)
+        except Exception as e:
+            log.error("주간 요약 실패: %s", e)
         if len(self.sent_keys) > 1000:
-            self.sent_keys.clear()
+            # 통째로 지우면 같은 분에 중복 알림이 갈 수 있음 → 6시간 지난 것만 정리
+            cut = (now - timedelta(hours=6)).strftime("%Y%m%d%H%M")
+            self.sent_keys = {k for k in self.sent_keys if k[:12] >= cut}
 
     @ticker.before_loop
     async def before_ticker(self):
@@ -491,8 +564,8 @@ class BossBot(discord.Client):
                 if n < max(2, (len(ids) + 1) // 2):
                     log.info("보류: %s 진행중 %d마리만 ACTIVE 전환 %s (리스폰일 수 있어 3분간 더 봄)", name, n, sorted(fl))
                     continue
-            elif n < max(min(2, len(ids)), (max(waiting, 1) + 1) // 2):
-                continue  # 아직 소수만 바뀜 → 조금 더 지켜봄 (3분 안에 절반 넘게 바뀌어야 시작으로 인정)
+            elif n < max(1, (waiting + 1) // 2):
+                continue  # 아직 소수만 바뀜 → 조금 더 지켜봄 (3분 안에, 쉬고 있던 보스의 절반 이상이 바뀌어야 시작으로 인정)
             last = self.last_sync.get(name)
             if last and now - last < timedelta(minutes=info["active_min"]):
                 fl.clear()
@@ -519,11 +592,20 @@ class BossBot(discord.Client):
             if not info or info.get("type") != "cycle" or info.get("unsynced"):
                 continue   # 시간표 확정 전이면 몇 분째인지 몰라서 기록 안 함
             start = current_window_start(info, now)
+            if already_recorded(name, start):
+                log.info("재등장 후 처치라 기록 안 함: %s (%s 타임)", name, start.strftime("%H:%M"))
+                continue   # 한 타임에 두 번째 처치(리스폰)는 골든 계산에서 제외 → 첫 처치만
             m = record_kill(name, start, now)
             got.append(f"{name} +{int(m)}분")
             log.info("처치 기록: %s (%s 시작 +%.1f분)", name, start.strftime("%H:%M"), m)
         if got:
+            before = {g["name"]: g.get("eff") for g in golden}
             golden = load_golden()
+            for g in golden:
+                old = before.get(g["name"])
+                if old is not None and g.get("eff") is not None and g["eff"] != old:
+                    # 채널 안내는 안 보냄(혼잡 방지) → 로그와 시작 알림의 ⬆ 표시, /골든타임 표로 확인
+                    log.info("골든 자동 조정: %s %s%% → %s%% (최근 적중 %s%%)", g["name"], old, g["eff"], g.get("recent_hit"))
 
     async def _on_detected_start(self, name: str, info: dict, detected: datetime):
         """사이트에서 시작 감지 → 예측과 다르면 기준시각 보정 + 시작 알림"""
@@ -592,32 +674,88 @@ class BossBot(discord.Client):
         dep, g, _, arr = it
         where = f"{g['floor']}층" if g["floor"] else g["cycle"]
         go = f"늦어도 {dep:%H:%M} 출발 → {arr:%H:%M} 도착" if (g["travel"] and show_dep) else f"{arr:%H:%M}까지 도착"
-        return f"**{g['name']}** {where} · {go} · 잡을 확률 **{g['rate']}%**"
+        up = " ⬆" if g.get("eff", 0) > g.get("target", 0) else ""
+        return f"**{g['name']}** {where} · {go} · 잡을 확률 **{g['rate']}%**{up}"
 
     async def golden_tick(self, now: datetime):
+        """출발 시각이 된 보스를 보냄. 보스마다(타임별) 한 번만, 계산이 바뀌어도 빠지지 않게 2분까지 따라잡음"""
         if not golden:
             return
         mention = f"<@&{ROLE_ID}> " if ROLE_ID else ""
-        for grp in self.golden_groups(self.golden_items(now)):
-            t = grp[0][0]
-            names = ",".join(it[1]["name"] for it in grp)
-            if GOLDEN_PRE_MIN and t - timedelta(minutes=GOLDEN_PRE_MIN) == now:
-                key = f"{t:%Y%m%d%H%M}|{names}|golden_pre"
-                if key not in self.sent_keys:
-                    self.sent_keys.add(key)
-                    who = " · ".join(it[1]["name"] for it in grp)
-                    await self._notify(f"{mention}⏰ {GOLDEN_PRE_MIN}분 뒤 골든타임: {who}")
-            if t == now:
-                key = f"{t:%Y%m%d%H%M}|{names}|golden_now"
-                if key in self.sent_keys:
-                    continue
-                self.sent_keys.add(key)
-                if len(grp) == 1:
-                    it = grp[0]
-                    await self._notify(f"{mention}🎯 **{it[1]['name']} 골든타임이야 지금 출발해!**\n└ " + self.golden_line(it))
-                else:
-                    body = "\n".join("🔹 " + self.golden_line(it) for it in grp)
-                    await self._notify(f"{mention}🎯 **골든타임! 지금 출발! ({len(grp)}곳 중 골라서 가세요)**\n{body}")
+        items = self.golden_items(now)
+        key = lambda it, kind: f"{it[2]:%Y%m%d%H%M}|{it[1]['name']}|{kind}"   # 보스타임 시작 + 보스 = 고정 키
+        catch = timedelta(minutes=2)
+        group = timedelta(minutes=GOLDEN_GROUP_MIN)
+
+        if GOLDEN_PRE_MIN:
+            pre = timedelta(minutes=GOLDEN_PRE_MIN)
+            due = [it for it in items if now - catch < it[0] - pre <= now and key(it, "gp") not in self.sent_keys]
+            if due:
+                due += [it for it in items if now < it[0] - pre <= now + group and key(it, "gp") not in self.sent_keys and it not in due]
+                for it in due:
+                    self.sent_keys.add(key(it, "gp"))
+                who = " · ".join(it[1]["name"] for it in sorted(due, key=lambda x: x[0]))
+                await self._notify(f"{mention}⏰ {GOLDEN_PRE_MIN}분 뒤 골든타임: {who}")
+
+        due = [it for it in items if now - catch < it[0] <= now and key(it, "gn") not in self.sent_keys]
+        if not due:
+            return
+        due += [it for it in items if now < it[0] <= now + group and key(it, "gn") not in self.sent_keys and it not in due]
+        due.sort(key=lambda x: (x[0], x[1]["floor"] == 0, x[1]["floor"]))
+        for it in due:
+            self.sent_keys.add(key(it, "gn"))
+        if len(due) == 1:
+            it = due[0]
+            await self._notify(f"{mention}🎯 **{it[1]['name']} 골든타임이야 지금 출발해!**\n└ " + self.golden_line(it))
+        else:
+            body = "\n".join("🔹 " + self.golden_line(it) for it in due)
+            await self._notify(f"{mention}🎯 **골든타임! 지금 출발! ({len(due)}곳 중 골라서 가세요)**\n{body}")
+
+    async def weekly_tick(self, now: datetime):
+        """매주 GOLDEN_WEEKLY_DAY 요일 GOLDEN_WEEKLY_HOUR 시 정각에 골든 기준 주간 요약 1회"""
+        if not GOLDEN_WEEKLY or not golden:
+            return
+        if now.weekday() != GOLDEN_WEEKLY_DAY or now.hour != GOLDEN_WEEKLY_HOUR or now.minute != 0:
+            return
+        path = os.path.join(os.path.dirname(GOLDEN_LOG) or ".", "golden_weekly.json")
+        state = {}
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    state = json.load(f)
+        except Exception:
+            state = {}
+        today = now.strftime("%Y-%m-%d")
+        if state.get("last_sent") == today:
+            return   # 재시작해도 같은 날 두 번 안 보냄
+        prev = state.get("snapshot", {})
+        week_ago = now - timedelta(days=7)
+        cnt: dict[str, int] = {}
+        for name, t, _ in _read_kills(GOLDEN_LOG):
+            try:
+                if datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ) >= week_ago:
+                    cnt[name] = cnt.get(name, 0) + 1
+            except ValueError:
+                pass
+        rows = []
+        for g in golden:
+            if "depart" not in g:
+                continue
+            label = f"{g['floor']}F {g['name']}" if g["floor"] else g["name"]
+            tune = f"{g['target']}→{g['eff']}%⬆" if g["eff"] > g["target"] else f"{g['target']}%"
+            old = prev.get(g["name"])
+            chg = "" if old is None or old == g["eff"] else f" (지난주 {old}%)"
+            hit = f"{g['recent_hit']}%" if "recent_hit" in g else "-"
+            rows.append(f"{label:<12} +{g['depart']:>2}분  {tune:<9} 최근적중 {hit:<4} 기록 {cnt.get(g['name'], 0)}건{chg}")
+        msg = (f"📊 **이번 주 골든 요약** ({week_ago:%m/%d}~{now:%m/%d})\n```\n" + "\n".join(rows) +
+               "\n```\n-# +N분 = 보스타임 시작 후 출발 · ⬆ = 최근 빨리 잡혀 자동으로 앞당김 · 기록 = 이번 주 봇이 직접 잡은 처치 수")
+        await self._notify(msg)
+        state = {"last_sent": today, "snapshot": {g["name"]: g.get("eff") for g in golden}}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error("주간 요약 저장 실패: %s", e)
 
     def golden_plan_text(self, cycle_name: str, start: datetime) -> str:
         """보스타임 시작 알림에 붙일 '이번 타임 골든 순서' 요약"""
@@ -627,10 +765,16 @@ class BossBot(discord.Client):
         if not its:
             return ""
         lines = []
+        tuned = False
         for grp in self.golden_groups(its):
-            who = " · ".join(f"{it[1]['name']}({it[1]['rate']}%)" for it in grp)
-            lines.append(f"`{grp[0][0]:%H:%M}` {who}")
-        return "\n🎯 **이번 타임 골든 순서** (늦어도 이때 출발)\n" + "\n".join(lines)
+            parts = []
+            for it in grp:
+                up = it[1].get("eff", 0) > it[1].get("target", 0)
+                tuned |= up
+                parts.append(f"{it[1]['name']}({it[1]['rate']}%{'⬆' if up else ''})")
+            lines.append(f"`{grp[0][0]:%H:%M}` " + " · ".join(parts))
+        foot = "\n-# ⬆ = 최근에 빨리 잡혀서 봇이 자동으로 출발을 앞당긴 보스 (자세히: /골든타임)" if tuned else ""
+        return "\n🎯 **이번 타임 골든 순서** (늦어도 이때 출발)\n" + "\n".join(lines) + foot
 
     async def _notify(self, text: str):
         try:
@@ -788,8 +932,8 @@ async def golden_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(f"아직 골든타임 데이터가 없어요. `{GOLDEN_SEED}` 을 GitHub에 올려주세요.", ephemeral=True)
         return
     now = datetime.now(TZ)
-    lines = [f"🎯 **골든타임** (잡을 확률 {int(GOLDEN_RATE*100)}% · 보스별 최근 {GOLDEN_RECENT}건 기준 · 이동 10~30층 {TRAVEL_LOW}분 / 40층~ {TRAVEL_HIGH}분)", "```",
-             "보스          출발    도착    확률  중간값  건수(봇학습)"]
+    lines = [f"🎯 **골든타임** (기본 {int(GOLDEN_RATE*100)}% · 보스별 최근 {GOLDEN_RECENT}건 기준 · 이동 10~30층 {TRAVEL_LOW}분 / 40층~ {TRAVEL_HIGH}분)", "```",
+             "보스          출발    도착    목표→계산  최근적중  건수(봇학습)"]
     for g in golden:
         label = f"{g['floor']}F {g['name']}" if g["floor"] else g["name"]
         if "depart" not in g:
@@ -803,10 +947,44 @@ async def golden_cmd(interaction: discord.Interaction):
             if nxt:
                 dep = (nxt + timedelta(minutes=g["depart"])).strftime("%H:%M")
                 arr = (nxt + timedelta(minutes=g["arrive"])).strftime("%H:%M")
-        lines.append(f"{label:<12}  {dep:<6}  {arr:<6}  {g['rate']}%  {g['median_kill']}분   {g['n']}({g['learned']})")
+        tune = f"{g['target']}→{g['eff']}%" if g["eff"] != g["target"] else f"{g['target']}%"
+        hit = f"{g['recent_hit']}%" if "recent_hit" in g else "-"
+        lines.append(f"{label:<12}  {dep:<6}  {arr:<6}  {tune:<9}  {hit:<6}  {g['n']}({g['learned']})")
     lines.append("```")
-    lines.append("※ 시각은 다음 골든 알림 기준. 봇이 사이트에서 처치를 감지할 때마다 자동으로 다시 계산돼요.")
+    lines.append("※ 최근적중 = 이 기준으로 최근 판에 실제로 안 놓쳤던 비율. 목표보다 낮으면 계산 기준을 자동으로 올려요.")
     await interaction.response.send_message("\n".join(lines))
+
+
+@client.tree.command(name="골든기준", description="보스별 골든 기준 확률 바꾸기 (예: 뱀파이어 90). '기본' 입력 시 기본값으로")
+@app_commands.describe(이름="보스 이름 (예: 뱀파이어)", 확률="50~99 숫자, 또는 '기본'")
+async def set_boss_rate(interaction: discord.Interaction, 이름: str, 확률: str):
+    global golden
+    if 이름 not in GOLDEN_BOSSES:
+        await interaction.response.send_message(f"❌ 골든 대상 보스가 아니에요. 가능: {', '.join(GOLDEN_BOSSES)}", ephemeral=True)
+        return
+    cur = {}
+    if os.path.exists(_rates_path()):
+        try:
+            with open(_rates_path(), encoding="utf-8") as f:
+                cur = json.load(f)
+        except Exception:
+            cur = {}
+    t = 확률.strip().replace("%", "")
+    if t in ("기본", "default", "0"):
+        cur[이름] = None
+        shown = f"기본 {int(GOLDEN_RATE*100)}%"
+    elif t.isdigit() and 50 <= int(t) <= 99:
+        cur[이름] = int(t)
+        shown = f"{int(t)}%"
+    else:
+        await interaction.response.send_message("❌ 확률은 50~99 숫자 또는 '기본' 으로 입력해 주세요.", ephemeral=True)
+        return
+    with open(_rates_path(), "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
+    golden = load_golden()
+    g = next(x for x in golden if x["name"] == 이름)
+    tail = f" → 이제 시작 후 +{g['depart']}분 출발 (도착 +{g['arrive']}분)" if "depart" in g else ""
+    await interaction.response.send_message(f"✅ **{이름}** 골든 기준 {shown}{tail}")
 
 
 @client.tree.command(name="보스번호", description="골든타임 자동학습용 사이트 스폰번호 등록 (예: 데스나이트 45)")
