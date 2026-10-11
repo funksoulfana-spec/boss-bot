@@ -261,6 +261,8 @@ GOLDEN_BOSSES = {
     "사신":       ("오만의탑", 100, None, 63),
     "데스나이트":       ("라스타바드·DK", 0, 0, 39),
     "에이션트자이언트": ("아덴(본토)", 0, 0, 44),
+    "발록":             ("라스타바드·DK", 0, 5, None),   # 스폰번호는 사이트에서 이름으로 자동 찾기
+    "개미여왕":         ("라스타바드·DK", 0, 5, None),
 }
 GOLDEN_IDS_FILE = os.environ.get("GOLDEN_IDS_FILE", "golden_ids.json")   # /보스번호 로 넣은 번호 저장
 
@@ -285,6 +287,27 @@ def boss_rates() -> dict[str, int]:
     return rates
 
 
+# 사이트(영문) 이름 — 스폰번호가 비어 있는 보스는 보스 페이지에서 이 이름으로 번호를 찾아 저장
+GOLDEN_EN = {"발록": "Varlok", "개미여왕": "Giant Ant Queen"}
+BOSS_PAGE_URL = os.environ.get("BOSS_PAGE_URL", "https://l1justice.com/lineage/database/bosses/")
+
+
+def parse_spawn_ids(html: str) -> dict[str, list[int]]:
+    """보스 페이지 HTML → {영문이름: [스폰번호,...]}  (한 줄 = data-spawn-id + 몬스터 링크 이름)"""
+    import re
+    out: dict[str, list[int]] = {}
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I):
+        sid = re.search(r'data-spawn-id="(\d+)"', row)
+        name = re.search(r'/monsters/\d+/?"[^>]*>\s*([^<]+?)\s*</a>', row)
+        if sid and name:
+            out.setdefault(name.group(1).strip(), []).append(int(sid.group(1)))
+    return out
+
+
+def _travel_path() -> str:
+    return os.path.join(os.path.dirname(GOLDEN_LOG) or ".", "golden_travel.json")
+
+
 def golden_ids() -> dict[str, int]:
     ids = {n: v[3] for n, v in GOLDEN_BOSSES.items() if v[3]}
     if os.path.exists(GOLDEN_IDS_FILE):
@@ -298,6 +321,14 @@ def golden_ids() -> dict[str, int]:
 
 def _travel(name: str) -> int:
     cyc, floor, travel, _ = GOLDEN_BOSSES[name]
+    try:   # /이동시간 으로 바꾼 값 우선
+        if os.path.exists(_travel_path()):
+            with open(_travel_path(), encoding="utf-8") as f:
+                v = json.load(f).get(name)
+            if v is not None:
+                return int(v)
+    except Exception as e:
+        log.warning("이동시간 파일 읽기 실패: %s", e)
     if travel is not None:
         return travel
     return TRAVEL_LOW if floor <= 30 else TRAVEL_HIGH
@@ -519,6 +550,10 @@ class BossBot(discord.Client):
             if self.site_ok is not True:
                 log.info("사이트 상태 수신 OK (%d개)", len(states))
             self.site_ok = True
+            try:
+                await self._discover_ids()
+            except Exception as e:
+                log.warning("스폰번호 자동 찾기 실패: %s", e)
         except Exception as e:
             if self.site_ok is not False:
                 log.warning("사이트 상태 수신 실패: %s", e)
@@ -579,6 +614,48 @@ class BossBot(discord.Client):
     @site_poller.before_loop
     async def before_poller(self):
         await self.wait_until_ready()
+
+    async def _discover_ids(self):
+        """스폰번호 없는 골든 보스(발록·개미여왕 등)를 보스 페이지에서 이름으로 찾아 저장 (1시간에 한 번까지)"""
+        global golden
+        known = golden_ids()
+        missing = [n for n in GOLDEN_EN if n not in known]
+        if not missing:
+            return
+        last = getattr(self, "_discover_at", None)
+        if last and datetime.now(TZ) - last < timedelta(hours=1):
+            return
+        self._discover_at = datetime.now(TZ)
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+                async with s.get(BOSS_PAGE_URL, headers={"User-Agent": "boss-alarm-bot"}) as r:
+                    html = await r.text()
+        except Exception as e:
+            log.warning("보스 페이지 읽기 실패: %s", e)
+            return
+        found = parse_spawn_ids(html)
+        cur = {}
+        if os.path.exists(GOLDEN_IDS_FILE):
+            try:
+                with open(GOLDEN_IDS_FILE, encoding="utf-8") as f:
+                    cur = json.load(f)
+            except Exception:
+                cur = {}
+        added = []
+        for n in missing:
+            ids = found.get(GOLDEN_EN[n], [])
+            if ids:
+                cur[n] = ids[0]
+                added.append(f"{n}={ids[0]}")
+                if len(ids) > 1:
+                    log.warning("%s 스폰번호가 여러 개 %s → 첫 번째 사용", n, ids)
+        if added:
+            with open(GOLDEN_IDS_FILE, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            log.info("스폰번호 자동 등록: %s", ", ".join(added))
+        else:
+            log.warning("보스 페이지에서 스폰번호를 못 찾음: %s (/보스번호 로 직접 등록 가능)", ", ".join(missing))
 
     async def _learn_kills(self, prev: dict, states: dict, now: datetime):
         """사이트에서 보스가 DEAD 로 바뀌는 순간 = 처치 → 기록 쌓고 골든타임 다시 계산"""
@@ -985,6 +1062,36 @@ async def set_boss_rate(interaction: discord.Interaction, 이름: str, 확률: s
     g = next(x for x in golden if x["name"] == 이름)
     tail = f" → 이제 시작 후 +{g['depart']}분 출발 (도착 +{g['arrive']}분)" if "depart" in g else ""
     await interaction.response.send_message(f"✅ **{이름}** 골든 기준 {shown}{tail}")
+
+
+@client.tree.command(name="이동시간", description="골든 보스 이동시간(분) 바꾸기 (예: 발록 3). '기본' 입력 시 원래대로")
+@app_commands.describe(이름="보스 이름 (예: 발록)", 분="0~30 숫자, 또는 '기본'")
+async def set_travel(interaction: discord.Interaction, 이름: str, 분: str):
+    global golden
+    if 이름 not in GOLDEN_BOSSES:
+        await interaction.response.send_message(f"❌ 골든 대상 보스가 아니에요. 가능: {', '.join(GOLDEN_BOSSES)}", ephemeral=True)
+        return
+    cur = {}
+    if os.path.exists(_travel_path()):
+        try:
+            with open(_travel_path(), encoding="utf-8") as f:
+                cur = json.load(f)
+        except Exception:
+            cur = {}
+    t = 분.strip().replace("분", "")
+    if t in ("기본", "default"):
+        cur.pop(이름, None)
+    elif t.isdigit() and 0 <= int(t) <= 30:
+        cur[이름] = int(t)
+    else:
+        await interaction.response.send_message("❌ 0~30 숫자 또는 '기본' 으로 입력해 주세요.", ephemeral=True)
+        return
+    with open(_travel_path(), "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
+    golden = load_golden()
+    g = next(x for x in golden if x["name"] == 이름)
+    tail = f" → 시작 후 +{g['depart']}분 출발 (도착 +{g['arrive']}분)" if "depart" in g else ""
+    await interaction.response.send_message(f"✅ **{이름}** 이동시간 {_travel(이름)}분{tail}")
 
 
 @client.tree.command(name="보스번호", description="골든타임 자동학습용 사이트 스폰번호 등록 (예: 데스나이트 45)")
