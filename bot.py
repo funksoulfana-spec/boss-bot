@@ -172,6 +172,11 @@ def fmt_remaining(delta: timedelta) -> str:
     return f"{h}시간 {m}분" if h else f"{m}분"
 
 
+def dt(t: datetime, style: str = "t") -> str:
+    """디스코드 시간 코드 → 보는 사람 기기 시간대로 자동 변환 (t=시각, R=남은 시간 '26분 후')"""
+    return f"<t:{int(t.timestamp())}:{style}>"
+
+
 def fmt_dur(minutes: int) -> str:
     h, m = divmod(minutes, 60)
     if h and m:
@@ -700,7 +705,7 @@ class BossBot(discord.Client):
             if key not in self.sent_keys:
                 self.sent_keys.add(key)
                 await self.announce(name, "start", detected, pre=False)
-            await self._notify(f"📌 **{name}** 서버 재시작 후 첫 보스타임 확인 ({detected:%H:%M}) → 시간표 확정!")
+            await self._notify(f"📌 **{name}** 서버 재시작 후 첫 보스타임 확인 ({dt(detected)}) → 시간표 확정!")
             return
         if diff_min <= SYNC_TOLERANCE_MIN:
             log.info("자동확인: %s 예측대로 시작 (%s)", name, detected.strftime("%H:%M"))
@@ -715,7 +720,7 @@ class BossBot(discord.Client):
             await self.announce(name, "start", detected, pre=False)
         try:
             channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
-            await channel.send(f"🔄 **{name}** 시간표 자동 보정: 예상 {predicted:%H:%M} → 실제 {detected:%H:%M} (사이트 기준)")
+            await channel.send(f"🔄 **{name}** 시간표 자동 보정: 예상 {dt(predicted)} → 실제 {dt(detected)} (사이트 기준)")
         except Exception as e:
             log.error("보정 안내 전송 실패: %s", e)
 
@@ -750,7 +755,7 @@ class BossBot(discord.Client):
     def golden_line(it, show_dep: bool = True) -> str:
         dep, g, _, arr = it
         where = f"{g['floor']}층" if g["floor"] else g["cycle"]
-        go = f"늦어도 {dep:%H:%M} 출발 → {arr:%H:%M} 도착" if (g["travel"] and show_dep) else f"{arr:%H:%M}까지 도착"
+        go = f"늦어도 {dt(dep)} 출발 → {dt(arr)} 도착" if (g["travel"] and show_dep) else f"{dt(arr)}까지 도착"
         up = " ⬆" if g.get("eff", 0) > g.get("target", 0) else ""
         return f"**{g['name']}** {where} · {go} · 잡을 확률 **{g['rate']}%**{up}"
 
@@ -849,7 +854,7 @@ class BossBot(discord.Client):
                 up = it[1].get("eff", 0) > it[1].get("target", 0)
                 tuned |= up
                 parts.append(f"{it[1]['name']}({it[1]['rate']}%{'⬆' if up else ''})")
-            lines.append(f"`{grp[0][0]:%H:%M}` " + " · ".join(parts))
+            lines.append(f"**{dt(grp[0][0])}** ({dt(grp[0][0], 'R')}) " + " · ".join(parts))
         foot = "\n-# ⬆ = 최근에 빨리 잡혀서 봇이 자동으로 출발을 앞당긴 보스 (자세히: /골든타임)" if tuned else ""
         return "\n🎯 **이번 타임 골든 순서** (늦어도 이때 출발)\n" + "\n".join(lines) + foot
 
@@ -870,7 +875,7 @@ class BossBot(discord.Client):
         channel = self.get_channel(CHANNEL_ID) or await self.fetch_channel(CHANNEL_ID)
         mention = f"<@&{ROLE_ID}> " if ROLE_ID else ""
         info = bosses.get(name, {})
-        t = ev_time.strftime("%H:%M")
+        t = dt(ev_time)   # 보는 사람 시간대로 표시
         if kind == "start":
             if pre:
                 msg = f"{mention}⏰ **{name}** 시작 {PRE_ALERT_MIN}분 전! ({t})"
@@ -934,7 +939,7 @@ async def add_cycle(interaction: discord.Interaction, 이름: str, 시작시각:
     st, ns, ne = cycle_status(bosses[이름], now)
     await interaction.response.send_message(
         f"✅ **{이름}** (주기) 등록: {fmt_dur(a)} 진행 → {fmt_dur(r)} 대기 (한 바퀴 {fmt_dur(a + r)})\n"
-        f"기준 시작 {anchor:%m/%d %H:%M} · 지금 {st} · 다음 시작 {ns:%H:%M}"
+        f"기준 시작 {dt(anchor, 'f')} · 지금 {st} · 다음 시작 {dt(ns)}"
     )
 
 
@@ -955,7 +960,7 @@ async def reset_anchor(interaction: discord.Interaction, 이름: str, 시작시�
     info.pop("unsynced", None)
     save_bosses(bosses)
     st, ns, _ = cycle_status(info, now)
-    await interaction.response.send_message(f"🔧 **{이름}** 기준 시작 {anchor:%m/%d %H:%M} 으로 재설정 · 지금 {st} · 다음 시작 {ns:%H:%M}")
+    await interaction.response.send_message(f"🔧 **{이름}** 기준 시작 {dt(anchor, 'f')} 으로 재설정 · 지금 {st} · 다음 시작 {dt(ns)}")
 
 
 @client.tree.command(name="보스삭제", description="보스 삭제")
@@ -978,7 +983,7 @@ async def list_bosses(interaction: discord.Interaction):
     rows = []
     for name, info in bosses.items():
         if info.get("type") == "cycle" and info.get("unsynced"):
-            rows.append((now, f"⏳ {name:<10} 서버 재시작 후 대기 · 보스 뜨면 자동 확정"))
+            rows.append((now, f"⏳ **{name}** · 서버 재시작 후 대기 · 보스 뜨면 자동 확정"))
             continue
         if info.get("type") == "cycle":
             st, ns, ne = cycle_status(info, now)
@@ -988,19 +993,19 @@ async def list_bosses(interaction: discord.Interaction):
                 cycle = timedelta(minutes=info["active_min"] + info["rest_min"])
                 k = int((now - anchor) / cycle)
                 cur_end = anchor + cycle * k + timedelta(minutes=info["active_min"])
-                rows.append((cur_end, f"🟢 {name:<10} 진행중 · 종료까지 {fmt_remaining(cur_end - now)} ({cur_end:%H:%M}) · 다음 시작 {ns:%H:%M}"))
+                rows.append((cur_end, f"🟢 **{name}** · 진행중 · 종료까지 {fmt_remaining(cur_end - now)} ({dt(cur_end)}) · 다음 시작 {dt(ns)}"))
             else:
-                rows.append((ns, f"⚪ {name:<10} 대기중 · 시작까지 {fmt_remaining(ns - now)} ({ns:%H:%M})"))
+                rows.append((ns, f"⚪ **{name}** · 대기중 · 시작까지 {fmt_remaining(ns - now)} ({dt(ns)})"))
         else:
             for t in info.get("times", []):
                 h, m = map(int, t.split(":"))
                 ns = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if ns <= now:
                     ns += timedelta(days=1)
-                rows.append((ns, f"📌 {name:<10} 매일 {t} · 남은 시간 {fmt_remaining(ns - now)}"))
+                rows.append((ns, f"📌 **{name}** · 매일 {dt(ns)} · 남은 시간 {fmt_remaining(ns - now)}"))
     rows.sort(key=lambda r: r[0])
-    body = "\n".join(r[1] for r in rows)
-    await interaction.response.send_message(f"📋 **보스 시간표** ({now:%H:%M} 기준)\n```\n{body}\n```")
+    body = "\n".join("• " + r[1] for r in rows)
+    await interaction.response.send_message(f"📋 **보스 시간표** ({dt(now)} 기준)\n{body}")
 
 
 @client.tree.command(name="골든타임", description="보스별 골든타임 (보스타임 시작 후 몇 분에 출발/도착)")
@@ -1009,26 +1014,25 @@ async def golden_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(f"아직 골든타임 데이터가 없어요. `{GOLDEN_SEED}` 을 GitHub에 올려주세요.", ephemeral=True)
         return
     now = datetime.now(TZ)
-    lines = [f"🎯 **골든타임** (기본 {int(GOLDEN_RATE*100)}% · 보스별 최근 {GOLDEN_RECENT}건 기준 · 이동 10~30층 {TRAVEL_LOW}분 / 40층~ {TRAVEL_HIGH}분)", "```",
-             "보스          출발    도착    목표→계산  최근적중  건수(봇학습)"]
+    lines = [f"🎯 **골든타임** · 기본 {int(GOLDEN_RATE*100)}% · 최근 {GOLDEN_RECENT}건 기준 (시각은 내 기기 시간대)"]
     for g in golden:
         label = f"{g['floor']}F {g['name']}" if g["floor"] else g["name"]
         if "depart" not in g:
-            lines.append(f"{label:<12}  데이터 부족 ({g['n']}건)")
+            lines.append(f"• **{label}** 데이터 부족 ({g['n']}건)")
             continue
         info = bosses.get(g["cycle"])
-        dep, arr = f"+{g['depart']}분", f"+{g['arrive']}분"
+        when = f"+{g['depart']}분 출발"
         if info and info.get("type") == "cycle" and not info.get("unsynced"):
             nxt = next((s for s in cycle_starts_around(info, now) + [cycle_starts_around(info, now)[-1] + timedelta(minutes=info["active_min"] + info["rest_min"])]
                         if s + timedelta(minutes=g["depart"]) > now and s >= client.started), None)
             if nxt:
-                dep = (nxt + timedelta(minutes=g["depart"])).strftime("%H:%M")
-                arr = (nxt + timedelta(minutes=g["arrive"])).strftime("%H:%M")
-        tune = f"{g['target']}→{g['eff']}%" if g["eff"] != g["target"] else f"{g['target']}%"
-        hit = f"{g['recent_hit']}%" if "recent_hit" in g else "-"
-        lines.append(f"{label:<12}  {dep:<6}  {arr:<6}  {tune:<9}  {hit:<6}  {g['n']}({g['learned']})")
-    lines.append("```")
-    lines.append("※ 최근적중 = 이 기준으로 최근 판에 실제로 안 놓쳤던 비율. 목표보다 낮으면 계산 기준을 자동으로 올려요.")
+                d = nxt + timedelta(minutes=g["depart"])
+                a_ = nxt + timedelta(minutes=g["arrive"])
+                when = f"{dt(d)} 출발" + (f"→{dt(a_)}" if g["travel"] else "")
+        tune = f"{g['target']}→{g['eff']}%⬆" if g["eff"] != g["target"] else f"{g['target']}%"
+        hit = f" · 적중 {g['recent_hit']}%" if "recent_hit" in g else ""
+        lines.append(f"• **{label}** {when} · {tune}{hit} · {g['n']}({g['learned']})건")
+    lines.append("-# 적중 = 최근 판에 실제로 안 놓쳤던 비율 · ⬆ = 자동으로 앞당김 · 건(봇학습)")
     await interaction.response.send_message("\n".join(lines))
 
 
