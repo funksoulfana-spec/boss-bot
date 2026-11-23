@@ -52,6 +52,7 @@ PRE_ALERT_MIN = _int_env("PRE_ALERT_MIN", 5)   # N분 전 예고 (0이면 끔)
 DATA_FILE = os.environ.get("DATA_FILE", "bosses.json")
 # 사이트 자동 보정 (l1justice 보스 상태 JSON) — 0 이면 끔
 AUTO_SYNC = os.environ.get("AUTO_SYNC", "1").strip() != "0"
+STATUS_PORT = _int_env("PORT", 8080)   # 보스 현황판이 골든 정보를 받아가는 주소의 포트 (Railway 가 PORT 를 자동으로 넣어줌)
 STATE_URL = os.environ.get("STATE_URL", "https://l1justice.com/lineage/database/bosses/state/")
 HOME_URL = os.environ.get("HOME_URL", "https://l1justice.com/lineage/")   # "Server Status: Online/Offline" 표시
 
@@ -454,6 +455,186 @@ def snap_30(t: datetime) -> datetime:
     return t.replace(minute=0 if t.minute < 30 else 30, second=0, microsecond=0)
 
 
+
+# ─────────────────────────────── 사이클 학습 (그 밖의 보스) ───────────────────────────────
+# 사이트 보스 페이지의 Cycle 이름(Caspa·DarkElder·Night·Baphomet·Beleth 등)별로
+#   INACTIVE→ACTIVE = 타임 시작, ACTIVE/DEAD→INACTIVE = 타임 끝 을 기록해서
+#   한 바퀴 길이(시작~다음 시작)와 진행 길이(시작~끝)를 스스로 알아냄.
+# 서버 재시작/오프라인 때는 '끊김'을 기록해서 그 사이 간격은 계산에 안 씀.
+LEARN_SKIP = {"Unknown"}   # 사이클 이름이 없는 보스만 빼고 전부 학습 (오만=Oren 도 심연의주인 때문에 같이 배움)
+LEARN_CLUSTER_MIN = 30      # 같은 사이클에서 이 분 안에 또 바뀌면 같은 시작(끝)으로 봄
+LEARN_TOL_MIN = 4           # 간격이 이 분 안에서 같으면 같은 길이로 인정
+LEARN_KEEP = 40             # 사이클별로 최근 몇 개 기록만 보관
+LEARN_KILLS_KEEP = 60      # 보스별 처치 기록(타임 시작 후 몇 분) 최근 몇 개 보관
+LEARN_MIN_KILLS = 10       # 이보다 적으면 '학습 중' (만날 확률 계산 안 함)
+LEARN_REGEN_MIN_N = 3      # 리젠(잡힌 뒤 다시 나오기까지) 이만큼 비슷하게 보이면 확정
+
+
+def _cycles_path() -> str:
+    return os.path.join(os.path.dirname(GOLDEN_LOG) or ".", "learned_cycles.json")
+
+
+def load_learn() -> dict:
+    try:
+        if os.path.exists(_cycles_path()):
+            with open(_cycles_path(), encoding="utf-8") as f:
+                d = json.load(f)
+                d.setdefault("id_cycle", {})
+                d.setdefault("cycles", {})
+                d.setdefault("ids", {})
+                return d
+    except Exception as e:
+        log.warning("사이클 학습 기록 읽기 실패: %s", e)
+    return {"id_cycle": {}, "map_at": None, "cycles": {}, "ids": {}}
+
+
+def save_learn(d: dict) -> None:
+    try:
+        with open(_cycles_path(), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+    except Exception as e:
+        log.warning("사이클 학습 기록 저장 실패: %s", e)
+
+
+def parse_spawn_cycles(html: str) -> dict[str, str]:
+    """보스 페이지 HTML → {스폰번호: 사이클이름}. 표 머리의 'Cycle' 칸 위치를 찾아 읽음"""
+    import re
+    def cells(row, tag):
+        return [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", c)).strip()
+                for c in re.findall(rf"<{tag}\b[^>]*>(.*?)</{tag}>", row, re.S | re.I)]
+    out: dict[str, str] = {}
+    idx = None
+    for row in re.findall(r"<tr\b.*?</tr>", html, re.S | re.I):   # <tr> 태그 자체도 포함 (번호가 거기 있을 수도)
+        th = cells(row, "th")
+        if th:
+            low = [h.lower() for h in th]
+            if "cycle" in low:
+                idx = low.index("cycle")
+            continue
+        sid = re.search(r'data-spawn-id="(\d+)"', row)
+        if not sid:
+            continue
+        td = cells(row, "td")
+        cyc = None
+        if idx is not None and idx < len(td):
+            cyc = td[idx]
+        else:   # 머리를 못 찾으면: 상태 · 이름 · 레벨(숫자) · 사이클 순서로 봄
+            for k in range(1, len(td) - 1):
+                if td[k].isdigit() and k >= 2:
+                    cyc = td[k + 1]
+                    break
+        if cyc and re.fullmatch(r"[A-Za-z0-9_]{2,30}", cyc):
+            out[sid.group(1)] = cyc
+    return out
+
+
+def learn_observe(d: dict, prev: dict, states: dict, now: datetime) -> list[str]:
+    """상태 변화를 기록으로 남김. 새로 기록된 것 설명을 돌려줌
+    - 사이클별: INACTIVE→ACTIVE = 타임 시작, ACTIVE/DEAD→INACTIVE = 타임 끝
+    - 보스(스폰번호)별: ACTIVE→DEAD = 처치 (그 타임 시작 후 몇 분째인지), DEAD→ACTIVE = 리젠 (잡힌 뒤 몇 분 만에)"""
+    groups: dict[str, list[str]] = {}
+    for sid, cyc in d.get("id_cycle", {}).items():
+        if cyc not in LEARN_SKIP:
+            groups.setdefault(cyc, []).append(sid)
+    ts = int(now.timestamp())
+    noted = []
+    ids_rec = d.setdefault("ids", {})
+    for cyc, ids in groups.items():
+        start = any(prev.get(i) == "INACTIVE" and states.get(i) == "ACTIVE" for i in ids)
+        end = any(prev.get(i) in ("ACTIVE", "DEAD") and states.get(i) == "INACTIVE" for i in ids)
+        c = d["cycles"].setdefault(cyc, {"starts": [], "ends": [], "breaks": []})
+        for kind, hit in (("starts", start), ("ends", end)):
+            if not hit:
+                continue
+            lst = c[kind]
+            if lst and ts - lst[-1] < LEARN_CLUSTER_MIN * 60:
+                continue
+            lst.append(ts)
+            del lst[:-LEARN_KEEP]
+            noted.append(f"{cyc} {'시작' if kind == 'starts' else '끝'}")
+        # 이 사이클의 '지금 타임' 시작 (끊김 이후 + 한 바퀴 안 이어야 믿음)
+        last_start = c["starts"][-1] if c["starts"] else None
+        limit = (learn_analyze(c).get("period") or 360) * 60
+        if last_start is not None and (ts - last_start > limit or any(b > last_start for b in c.get("breaks", []))):
+            last_start = None
+        for sid in ids:
+            old, new = prev.get(sid), states.get(sid)
+            if old is None or new is None or old == new:
+                continue
+            r = ids_rec.setdefault(sid, {"kills": [], "regens": [], "dead_at": None, "killed_in": None})
+            if old == "ACTIVE" and new == "DEAD":
+                r["dead_at"] = ts
+                if last_start is not None and r.get("killed_in") != last_start:   # 한 타임에 첫 처치만
+                    r["killed_in"] = last_start
+                    r["kills"].append(round((ts - last_start) / 60, 1))
+                    del r["kills"][:-LEARN_KILLS_KEEP]
+                    noted.append(f"{sid} 처치 +{int((ts - last_start) / 60)}분")
+            elif old == "DEAD" and new == "ACTIVE":
+                if r.get("dead_at") and not start:          # 타임 시작과 겹치면 리젠이 아님
+                    m = round((ts - r["dead_at"]) / 60, 1)
+                    if 1 <= m <= 24 * 60:
+                        r["regens"].append(m)
+                        del r["regens"][:-LEARN_KEEP]
+                        noted.append(f"{sid} 리젠 {int(m)}분")
+                r["dead_at"] = None
+            elif new == "INACTIVE":
+                r["dead_at"] = None                          # 타임 끝 → 다음 ACTIVE 는 리젠이 아니라 새 타임
+    return noted
+
+
+def learn_regen(r: dict) -> float | None:
+    """리젠 기록이 LEARN_REGEN_MIN_N 개 이상 비슷하면(±3분, 60% 이상) 그 값"""
+    rg = sorted(r.get("regens", []))
+    if len(rg) < LEARN_REGEN_MIN_N:
+        return None
+    med = rg[len(rg) // 2]
+    near = [x for x in rg if abs(x - med) <= 3]
+    if len(near) >= LEARN_REGEN_MIN_N and len(near) >= 0.6 * len(rg):
+        return round(sorted(near)[len(near) // 2], 1)
+    return None
+
+
+def learn_break(d: dict, now: datetime) -> None:
+    ts = int(now.timestamp())
+    for r in d.get("ids", {}).values():
+        r["dead_at"] = None          # 재시작 후 다시 뜬 건 리젠이 아님
+    for c in d.get("cycles", {}).values():
+        c.setdefault("breaks", []).append(ts)
+        del c["breaks"][:-LEARN_KEEP]
+
+
+def learn_analyze(c: dict) -> dict:
+    """기록 → 한 바퀴 길이/진행 길이/기준 시각. 같은 간격이 2번 이상 보이면 ready"""
+    starts = sorted(c.get("starts", []))
+    ends = sorted(c.get("ends", []))
+    breaks = sorted(c.get("breaks", []))
+    res = {"ready": False, "starts": len(starts), "ends": len(ends)}
+    gaps = []
+    for a, b in zip(starts, starts[1:]):
+        if any(a < x < b for x in breaks):
+            continue          # 서버 재시작이 끼어 있으면 버림
+        g = (b - a) / 60
+        if g >= 20:
+            gaps.append(g)
+    if not gaps:
+        return res
+    gmin = min(gaps)
+    base = [g for g in gaps if abs(g - gmin) <= LEARN_TOL_MIN]
+    period = sorted(base)[len(base) // 2]
+    consistent = all(abs(g - round(g / period) * period) <= LEARN_TOL_MIN * max(1, round(g / period)) for g in gaps)
+    res["period"] = round(period)
+    durs = []
+    for s in starts:
+        e = next((x for x in ends if s < x < s + period * 60 and not any(s < y < x for y in breaks)), None)
+        if e:
+            durs.append((e - s) / 60)
+    if durs:
+        res["active"] = round(sorted(durs)[len(durs) // 2])
+    res["anchor_ts"] = starts[-1]
+    res["ready"] = bool(len(base) >= 2 and consistent and durs and 0 < res["active"] < res["period"])
+    return res
+
+
 # ─────────────────────────────── 봇 본체 ───────────────────────────────
 class BossBot(discord.Client):
     def __init__(self):
@@ -466,6 +647,8 @@ class BossBot(discord.Client):
         self.site_ok: bool | None = None
         self.server_online: bool | None = None           # 리니지 서버 온라인 여부
         self.started = datetime.now(TZ)                  # 봇 켜진 시각 (이미 진행중인 타임은 골든 알림 생략)
+        self.learn = load_learn()                        # 그 밖의 보스 사이클 학습 기록 (Volume 에 저장)
+        self._map_at: datetime | None = None             # 스폰번호→사이클 표를 마지막으로 읽은 시각
 
     async def setup_hook(self):
         if GUILD_ID:
@@ -477,6 +660,65 @@ class BossBot(discord.Client):
         self.ticker.start()
         if AUTO_SYNC:
             self.site_poller.start()
+        try:
+            await self.start_status_server()
+        except Exception as e:
+            log.error("현황판용 주소 열기 실패 (알림은 정상 동작): %s", e)
+
+    # ───────── 보스 현황판용: 지금/곧 있을 골든 출발 정보를 JSON 으로 알려줌 (읽기 전용, 비밀 없음) ─────────
+    def golden_snapshot(self, now: datetime) -> dict:
+        items = []
+        for g in golden:
+            if "depart" not in g:
+                continue
+            info = bosses.get(g["cycle"])
+            if not info or info.get("type") != "cycle" or info.get("unsynced"):
+                continue   # 디스코드 알림을 안 보내는 상태면 현황판에도 안 줌
+            act = timedelta(minutes=info["active_min"])
+            for s in cycle_starts_around(info, now):
+                end = s + act
+                if end < now - timedelta(minutes=1) or s > now + timedelta(hours=6):
+                    continue
+                items.append({
+                    "name": g["name"], "cycle": g["cycle"], "floor": g["floor"],
+                    "window_start": s.isoformat(), "window_end": end.isoformat(),
+                    "depart": (s + timedelta(minutes=g["depart"])).isoformat(),
+                    "arrive": (s + timedelta(minutes=g["arrive"])).isoformat(),
+                    "rate": g["rate"],
+                    # 같은 시각을 숫자(초)로도: 윈도우 현황판이 날짜 글자를 잘못 읽지 않게
+                    "start_ts": int(s.timestamp()), "end_ts": int(end.timestamp()),
+                    "depart_ts": int((s + timedelta(minutes=g["depart"])).timestamp()),
+                })
+        cycles = {}
+        for cyc, c in self.learn.get("cycles", {}).items():
+            cycles[cyc] = learn_analyze(c)
+        id_cycle = {sid: cyc for sid, cyc in self.learn.get("id_cycle", {}).items() if cyc not in LEARN_SKIP}
+        boss = {}
+        for sid, r in self.learn.get("ids", {}).items():
+            if sid not in id_cycle or not (r.get("kills") or r.get("regens")):
+                continue
+            boss[sid] = {"kills": sorted(r.get("kills", [])), "regen": learn_regen(r), "regen_n": len(r.get("regens", []))}
+        return {"ok": True, "now": now.isoformat(), "server_online": self.server_online, "items": items,
+                "cycles": cycles, "id_cycle": id_cycle, "boss": boss, "min_kills": LEARN_MIN_KILLS}
+
+    async def start_status_server(self):
+        from aiohttp import web
+
+        async def golden_json(request):
+            body = json.dumps(self.golden_snapshot(datetime.now(TZ)), ensure_ascii=False)
+            return web.Response(text=body, content_type="application/json", charset="utf-8",
+                                headers={"Cache-Control": "no-store"})
+
+        async def health(request):
+            return web.Response(text="boss-bot ok")
+
+        app = web.Application()
+        app.router.add_get("/golden.json", golden_json)
+        app.router.add_get("/", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", STATUS_PORT).start()
+        log.info("현황판용 주소 열림: 포트 %d /golden.json", STATUS_PORT)
 
     async def on_ready(self):
         log.info("로그인 완료: %s (보스 %d개)", self.user, len(bosses))
@@ -533,6 +775,8 @@ class BossBot(discord.Client):
                     if info.get("type") == "cycle":
                         info["unsynced"] = True
                 save_bosses(bosses)
+                learn_break(self.learn, datetime.now(TZ))
+                save_learn(self.learn)
                 log.info("서버 오프라인 감지")
                 await self._notify("⛔ 리니지 서버 오프라인 감지 — 보스 알림을 잠시 멈출게요.")
             return  # 오프라인 중 사이트 보스 상태는 멈춰 있으므로 무시
@@ -575,11 +819,24 @@ class BossBot(discord.Client):
         flipped = sum(1 for k, v in states.items() if v == "ACTIVE" and prev.get(k, "INACTIVE") != "ACTIVE")
         if flipped >= MASS_FLIP:
             self.last_sync.clear()   # 중복방지 기록 초기화 → 진짜 보스타임은 놓치지 않게
+            learn_break(self.learn, datetime.now(TZ))
+            save_learn(self.learn)
             log.info("서버 재시작으로 판단 (%d개 동시 ACTIVE) — 이번 변화는 무시", flipped)
             await self._notify("🔌 서버 재시작 감지! 보스타임이 실제로 열리는 순간 시간표를 자동으로 맞출게요.")
             return
 
         await self._learn_kills(prev, states, datetime.now(TZ))
+        try:
+            await self._refresh_cycle_map()
+        except Exception as e:
+            log.warning("스폰번호→사이클 표 읽기 실패 (기존 표로 계속 학습): %s", e)
+        try:
+            noted = learn_observe(self.learn, prev, states, datetime.now(TZ))
+            if noted:
+                save_learn(self.learn)
+                log.info("사이클 학습 기록: %s", ", ".join(noted))
+        except Exception as e:
+            log.warning("사이클 학습 실패: %s", e)
 
         for name, info in list(bosses.items()):
             ids = [str(i) for i in info.get("spawn_ids", [])]
@@ -619,6 +876,25 @@ class BossBot(discord.Client):
     @site_poller.before_loop
     async def before_poller(self):
         await self.wait_until_ready()
+
+    async def _refresh_cycle_map(self):
+        """보스 페이지에서 스폰번호→사이클 이름 표를 6시간마다 새로 읽음"""
+        now = datetime.now(TZ)
+        if self._map_at and now - self._map_at < timedelta(hours=6) and self.learn.get("id_cycle"):
+            return
+        self._map_at = now
+        import aiohttp
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+            async with s.get(BOSS_PAGE_URL, headers={"User-Agent": "boss-alarm-bot"}) as r:
+                html = await r.text()
+        m = parse_spawn_cycles(html)
+        if len(m) >= 20:      # 너무 적게 읽히면 페이지 모양이 바뀐 것 → 기존 표 유지
+            self.learn["id_cycle"] = m
+            self.learn["map_at"] = now.isoformat()
+            save_learn(self.learn)
+            log.info("스폰번호→사이클 표 갱신: %d개", len(m))
+        else:
+            log.warning("스폰번호→사이클 표를 못 읽음 (%d개) — 기존 표 유지", len(m))
 
     async def _discover_ids(self):
         """스폰번호 없는 골든 보스(발록·개미여왕 등)를 보스 페이지에서 이름으로 찾아 저장 (1시간에 한 번까지)"""
@@ -1006,6 +1282,36 @@ async def list_bosses(interaction: discord.Interaction):
     rows.sort(key=lambda r: r[0])
     body = "\n".join("• " + r[1] for r in rows)
     await interaction.response.send_message(f"📋 **보스 시간표** ({dt(now)} 기준)\n{body}")
+
+
+@client.tree.command(name="사이클학습", description="DK·아덴·그 밖의 보스 사이클/처치 학습 현황")
+async def learn_cmd(interaction: discord.Interaction):
+    cyc = client.learn.get("cycles", {})
+    if not cyc:
+        await interaction.response.send_message("아직 기록이 없어요. 사이트에서 보스가 INACTIVE↔ACTIVE 로 바뀌는 걸 보면 쌓여요.", ephemeral=True)
+        return
+    lines = ["📚 **사이클 학습 현황** (타임: 시작을 3번 이상 보면 완료 / 보스: 처치 10번 이상)"]
+    for name in sorted(cyc):
+        a = learn_analyze(cyc[name])
+        if a["ready"]:
+            nxt = datetime.fromtimestamp(a["anchor_ts"], TZ)
+            lines.append(f"✅ **{name}** · 한 바퀴 {fmt_dur(a['period'])} · 진행 {fmt_dur(a['active'])} · 최근 시작 {dt(nxt)}")
+        else:
+            got = f" · 지금까지 추정 {fmt_dur(a['period'])}" if a.get("period") else ""
+            lines.append(f"⏳ **{name}** · 시작 {a['starts']}번 / 끝 {a['ends']}번 봄{got}")
+        ids = [sid for sid, c in client.learn.get("id_cycle", {}).items() if c == name]
+        recs = [client.learn.get("ids", {}).get(sid, {}) for sid in ids]
+        kills = sum(len(r.get("kills", [])) for r in recs)
+        done = sum(1 for r in recs if len(r.get("kills", [])) >= LEARN_MIN_KILLS or learn_regen(r))
+        if kills or done:
+            lines.append(f"　└ 보스 {len(ids)}곳 중 학습 완료 {done} · 처치 기록 {kills}건")
+    text = ""
+    for k, ln in enumerate(lines):          # 디스코드 한 메시지 2000자 제한
+        if len(text) + len(ln) + 1 > 1900:
+            text += f"\n…외 {len(lines) - k}줄"
+            break
+        text += ("\n" if text else "") + ln
+    await interaction.response.send_message(text, ephemeral=True)
 
 
 @client.tree.command(name="골든타임", description="보스별 골든타임 (보스타임 시작 후 몇 분에 출발/도착)")
