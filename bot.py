@@ -387,7 +387,7 @@ def load_golden() -> list[dict]:
         rec = sorted(allk.get(name, []))[-GOLDEN_RECENT:]     # 시간순 → 최근 N건
         ks = sorted(m for _, m in rec)
         n = len(ks)
-        g = {"name": name, "cycle": cyc, "floor": floor, "n": n, "learned": learned.get(name, 0)}
+        g = {"name": name, "cycle": cyc, "floor": floor, "n": n, "learned": learned.get(name, 0), "kills": ks}
         if n:
             g["median_kill"] = int(ks[n // 2])
         target = rates.get(name, round(GOLDEN_RATE * 100))
@@ -683,12 +683,22 @@ class BossBot(discord.Client):
                 end = s + act
                 if end < now - timedelta(minutes=1) or s > now + timedelta(hours=6):
                     continue
+                dep = s + timedelta(minutes=g["depart"])
+                # 골든 출발 시각이 지났는데 아직 안 잡혔으면 확률을 올려서 보여줌:
+                #   골든 확률 + (99 - 골든 확률) × (지난 판들 중 '지금 분'까지 이미 잡혔던 비율)
+                #   → 지난 판이라면 벌써 잡혔을 시각인데 아직 살아 있을수록 99% 에 가까워짐 (내려가지는 않음)
+                rate = g["rate"]
+                ks = g.get("kills") or []
+                if now >= dep and ks:
+                    el = (now - s).total_seconds() / 60
+                    done = sum(1 for x in ks if x <= el) / len(ks)
+                    rate = min(99, int(rate + (99 - rate) * done))
                 items.append({
                     "name": g["name"], "cycle": g["cycle"], "floor": g["floor"],
                     "window_start": s.isoformat(), "window_end": end.isoformat(),
                     "depart": (s + timedelta(minutes=g["depart"])).isoformat(),
                     "arrive": (s + timedelta(minutes=g["arrive"])).isoformat(),
-                    "rate": g["rate"],
+                    "rate": rate, "base_rate": g["rate"],
                     # 같은 시각을 숫자(초)로도: 윈도우 현황판이 날짜 글자를 잘못 읽지 않게
                     "start_ts": int(s.timestamp()), "end_ts": int(end.timestamp()),
                     "depart_ts": int((s + timedelta(minutes=g["depart"])).timestamp()),
