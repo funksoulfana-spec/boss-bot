@@ -469,6 +469,7 @@ LEARN_CLUSTER_MIN = 30      # 같은 사이클에서 이 분 안에 또 바뀌�
 LEARN_TOL_MIN = 4           # 간격이 이 분 안에서 같으면 같은 길이로 인정
 LEARN_KEEP = 40             # 사이클별로 최근 몇 개 기록만 보관
 LEARN_KILLS_KEEP = 60      # 보스별 처치 기록(타임 시작 후 몇 분) 최근 몇 개 보관
+LEARN_ID_CLUSTER_MIN = 20  # 한 보스 자리에서 이 분 안에 또 시작/끝이 보이면 같은 것으로 봄
 LEARN_MIN_KILLS = 10       # 이보다 적으면 '학습 중' (만날 확률 계산 안 함)
 LEARN_REGEN_MIN_N = 3      # 리젠(잡힌 뒤 다시 나오기까지) 이만큼 비슷하게 보이면 확정
 
@@ -485,10 +486,17 @@ def load_learn() -> dict:
                 d.setdefault("id_cycle", {})
                 d.setdefault("cycles", {})
                 d.setdefault("ids", {})
+                d.setdefault("idcyc", {})
+                if d.get("ver", 1) < 2:
+                    # v2: 처치 시각 기준을 '사이클 묶음 시작' → '그 보스 자리의 시작' 으로 바꿈 → 예전 처치 기록은 버림
+                    for r in d["ids"].values():
+                        r["kills"] = []
+                        r["killed_in"] = None
+                    d["ver"] = 2
                 return d
     except Exception as e:
         log.warning("사이클 학습 기록 읽기 실패: %s", e)
-    return {"id_cycle": {}, "map_at": None, "cycles": {}, "ids": {}}
+    return {"ver": 2, "id_cycle": {}, "map_at": None, "cycles": {}, "ids": {}, "idcyc": {}}
 
 
 def save_learn(d: dict) -> None:
@@ -555,25 +563,36 @@ def learn_observe(d: dict, prev: dict, states: dict, now: datetime) -> list[str]
             lst.append(ts)
             del lst[:-LEARN_KEEP]
             noted.append(f"{cyc} {'시작' if kind == 'starts' else '끝'}")
-        # 이 사이클의 '지금 타임' 시작 (끊김 이후 + 한 바퀴 안 이어야 믿음)
-        last_start = c["starts"][-1] if c["starts"] else None
-        limit = (learn_analyze(c).get("period") or 360) * 60
-        if last_start is not None and (ts - last_start > limit or any(b > last_start for b in c.get("breaks", []))):
-            last_start = None
+        # 보스 자리(스폰번호)마다 따로: 같은 사이클 이름이어도 각자 다른 시각에 도는 경우가 있음(예: Caspa 20곳)
+        idcyc = d.setdefault("idcyc", {})
         for sid in ids:
             old, new = prev.get(sid), states.get(sid)
             if old is None or new is None or old == new:
                 continue
+            ic = idcyc.setdefault(sid, {"starts": [], "ends": [], "breaks": []})
             r = ids_rec.setdefault(sid, {"kills": [], "regens": [], "dead_at": None, "killed_in": None})
+            # 이 자리의 타임 시작: INACTIVE→ACTIVE
+            #  + 죽은 표시가 타임 끝나고도 오래(60분+) 남아 있다가 사이클 시작 순간 ACTIVE 가 된 경우 (짧은 리젠은 제외)
+            stale = r.get("dead_at") is None or ts - r["dead_at"] >= 60 * 60
+            id_start = (old == "INACTIVE" and new == "ACTIVE") or (old == "DEAD" and new == "ACTIVE" and start and stale)
+            id_end = old in ("ACTIVE", "DEAD") and new == "INACTIVE"
+            for kind, hit in (("starts", id_start), ("ends", id_end)):
+                if hit and not (ic[kind] and ts - ic[kind][-1] < LEARN_ID_CLUSTER_MIN * 60):
+                    ic[kind].append(ts)
+                    del ic[kind][:-LEARN_KEEP]
             if old == "ACTIVE" and new == "DEAD":
                 r["dead_at"] = ts
+                last_start = ic["starts"][-1] if ic["starts"] else None
+                limit = (learn_analyze(ic).get("period") or 360) * 60
+                if last_start is not None and (ts - last_start > limit or any(b > last_start for b in ic.get("breaks", []))):
+                    last_start = None
                 if last_start is not None and r.get("killed_in") != last_start:   # 한 타임에 첫 처치만
                     r["killed_in"] = last_start
                     r["kills"].append(round((ts - last_start) / 60, 1))
                     del r["kills"][:-LEARN_KILLS_KEEP]
                     noted.append(f"{sid} 처치 +{int((ts - last_start) / 60)}분")
             elif old == "DEAD" and new == "ACTIVE":
-                if r.get("dead_at") and not start:          # 타임 시작과 겹치면 리젠이 아님
+                if r.get("dead_at") and not id_start:          # 타임 시작이면 리젠이 아님
                     m = round((ts - r["dead_at"]) / 60, 1)
                     if 1 <= m <= 24 * 60:
                         r["regens"].append(m)
@@ -583,6 +602,11 @@ def learn_observe(d: dict, prev: dict, states: dict, now: datetime) -> list[str]
             elif new == "INACTIVE":
                 r["dead_at"] = None                          # 타임 끝 → 다음 ACTIVE 는 리젠이 아니라 새 타임
     return noted
+
+
+def id_key(cyc: str, sid: str) -> str:
+    """현황판에 보낼 '보스 자리별 사이클' 이름 (예: Caspa#30). 현황판은 이 이름으로 길이/시작을 찾음"""
+    return f"{cyc}#{sid}"
 
 
 def learn_regen(r: dict) -> float | None:
@@ -601,7 +625,7 @@ def learn_break(d: dict, now: datetime) -> None:
     ts = int(now.timestamp())
     for r in d.get("ids", {}).values():
         r["dead_at"] = None          # 재시작 후 다시 뜬 건 리젠이 아님
-    for c in d.get("cycles", {}).values():
+    for c in list(d.get("cycles", {}).values()) + list(d.get("idcyc", {}).values()):
         c.setdefault("breaks", []).append(ts)
         del c["breaks"][:-LEARN_KEEP]
 
@@ -705,8 +729,14 @@ class BossBot(discord.Client):
                 })
         cycles = {}
         for cyc, c in self.learn.get("cycles", {}).items():
-            cycles[cyc] = learn_analyze(c)
-        id_cycle = {sid: cyc for sid, cyc in self.learn.get("id_cycle", {}).items() if cyc not in LEARN_SKIP}
+            cycles[cyc] = learn_analyze(c)          # 묶음 전체 (DK·아덴 구역 타이머용)
+        id_cycle = {}
+        for sid, cyc in self.learn.get("id_cycle", {}).items():
+            if cyc in LEARN_SKIP:
+                continue
+            k = id_key(cyc, sid)                    # 보스 자리별 (줄마다 만날 확률·학습 중 판단용)
+            id_cycle[sid] = k
+            cycles[k] = learn_analyze(self.learn.get("idcyc", {}).get(sid, {}))
         boss = {}
         for sid, r in self.learn.get("ids", {}).items():
             if sid not in id_cycle or not (r.get("kills") or r.get("regens")):
@@ -726,8 +756,18 @@ class BossBot(discord.Client):
         async def health(request):
             return web.Response(text="boss-bot ok")
 
+        async def learn_json(request):
+            # 학습 원본 (확인용): 사이클 묶음·보스 자리별 시작/끝 시각, 처치·리젠 기록
+            d = self.learn
+            raw = {"now": int(datetime.now(TZ).timestamp()), "cycles": d.get("cycles", {}), "idcyc": d.get("idcyc", {}),
+                   "ids": {k: {"kills": v.get("kills", []), "regens": v.get("regens", [])} for k, v in d.get("ids", {}).items()},
+                   "id_cycle": d.get("id_cycle", {})}
+            return web.Response(text=json.dumps(raw, ensure_ascii=False), content_type="application/json", charset="utf-8",
+                                headers={"Cache-Control": "no-store"})
+
         app = web.Application()
         app.router.add_get("/golden.json", golden_json)
+        app.router.add_get("/learn.json", learn_json)
         app.router.add_get("/", health)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1033,8 +1073,7 @@ class BossBot(discord.Client):
         if not sid:
             return None
         sid = str(sid)
-        cyc = self.learn.get("id_cycle", {}).get(sid)
-        c = self.learn.get("cycles", {}).get(cyc) if cyc else None
+        c = self.learn.get("idcyc", {}).get(sid)
         if not c:
             return None
         a = learn_analyze(c)
@@ -1063,8 +1102,7 @@ class BossBot(discord.Client):
         if not sid:
             return "스폰번호 확인 중"
         sid = str(sid)
-        cyc = self.learn.get("id_cycle", {}).get(sid)
-        a = learn_analyze(self.learn.get("cycles", {}).get(cyc, {})) if cyc else {"ready": False, "starts": 0}
+        a = learn_analyze(self.learn.get("idcyc", {}).get(sid, {}))
         n = len(self.learn.get("ids", {}).get(sid, {}).get("kills", []))
         t = "타임 학습 완료" if a["ready"] else f"타임 학습 중(시작 {a.get('starts', 0)}번 봄)"
         return f"{t} · 처치 {n}/{LEARN_MIN_KILLS}"
@@ -1384,7 +1422,9 @@ async def learn_cmd(interaction: discord.Interaction):
         ids = [sid for sid, c in client.learn.get("id_cycle", {}).items() if c == name]
         recs = [client.learn.get("ids", {}).get(sid, {}) for sid in ids]
         kills = sum(len(r.get("kills", [])) for r in recs)
-        done = sum(1 for r in recs if len(r.get("kills", [])) >= LEARN_MIN_KILLS or learn_regen(r))
+        done = sum(1 for sid, r in zip(ids, recs)
+                   if (learn_analyze(client.learn.get("idcyc", {}).get(sid, {}))["ready"] and len(r.get("kills", [])) >= LEARN_MIN_KILLS)
+                   or learn_regen(r))
         if kills or done:
             lines.append(f"　└ 보스 {len(ids)}곳 중 학습 완료 {done} · 처치 기록 {kills}건")
     text = ""
