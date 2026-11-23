@@ -669,8 +669,8 @@ class BossBot(discord.Client):
     def golden_snapshot(self, now: datetime) -> dict:
         items = []
         for g in golden:
-            if "depart" not in g:
-                continue
+            if "depart" not in g or g["cycle"] != "오만의탑":
+                continue   # 오만 밖 보스는 현황판이 학습값으로 직접 계산
             info = bosses.get(g["cycle"])
             if not info or info.get("type") != "cycle" or info.get("unsynced"):
                 continue   # 디스코드 알림을 안 보내는 상태면 현황판에도 안 줌
@@ -1000,10 +1000,65 @@ class BossBot(discord.Client):
         except Exception as e:
             log.error("보정 안내 전송 실패: %s", e)
 
+    def learned_golden(self, g: dict) -> dict | None:
+        """오만 밖 골든 보스(데스나이트·에이션트자이언트·발록·개미여왕 등):
+        봇이 사이트에서 직접 배운 타임(시작·길이)과 처치 기록으로만 골든 계산. 학습 전이면 None → 알림 안 보냄"""
+        sid = golden_ids().get(g["name"])
+        if not sid:
+            return None
+        sid = str(sid)
+        cyc = self.learn.get("id_cycle", {}).get(sid)
+        c = self.learn.get("cycles", {}).get(cyc) if cyc else None
+        if not c:
+            return None
+        a = learn_analyze(c)
+        if not a["ready"]:
+            return None
+        ks = sorted(self.learn.get("ids", {}).get(sid, {}).get("kills", []))
+        n = len(ks)
+        if n < LEARN_MIN_KILLS:
+            return None
+        # 기준 확률: 보스별로 정한 값(/골든기준). 예전 기록으로 자동 조정한 값(⬆)은 학습값에는 안 씀
+        target = g.get("target", round(GOLDEN_RATE * 100))
+        rate = target / 100
+        k = int((1 - rate) * n)                       # 도착 전에 이미 잡힌 판 수 (허용치) — 오만과 같은 방식
+        arrive = int(ks[min(k, n - 1)])
+        travel = _travel(g["name"])
+        out = dict(g)
+        out.update(arrive=arrive, travel=travel, depart=max(0, arrive - travel), eff=target,
+                   rate=round(100 * (1 - sum(1 for x in ks if x < arrive) / n)), n=n, learned=n, src="learn",
+                   period=a["period"], active=a["active"], anchor_ts=a["anchor_ts"])
+        out.pop("recent_hit", None)
+        return out
+
+    def learn_status(self, g: dict) -> str:
+        """학습 전인 오만 밖 골든 보스의 진행 상황 한 줄"""
+        sid = golden_ids().get(g["name"])
+        if not sid:
+            return "스폰번호 확인 중"
+        sid = str(sid)
+        cyc = self.learn.get("id_cycle", {}).get(sid)
+        a = learn_analyze(self.learn.get("cycles", {}).get(cyc, {})) if cyc else {"ready": False, "starts": 0}
+        n = len(self.learn.get("ids", {}).get(sid, {}).get("kills", []))
+        t = "타임 학습 완료" if a["ready"] else f"타임 학습 중(시작 {a.get('starts', 0)}번 봄)"
+        return f"{t} · 처치 {n}/{LEARN_MIN_KILLS}"
+
     def golden_items(self, now: datetime) -> list[tuple[datetime, dict, datetime, datetime]]:
         """(출발, 보스정보, 보스타임시작, 도착) — 봇 켜진 뒤 시작한 타임만"""
         items = []
         for g in golden:
+            if g["cycle"] != "오만의탑":
+                lg = self.learned_golden(g)
+                if not lg:
+                    continue       # 학습 전 → 부정확한 알림 대신 안 보냄
+                anchor = datetime.fromtimestamp(lg["anchor_ts"], TZ)
+                period = timedelta(minutes=lg["period"])
+                k = (now - anchor) // period
+                for s in (anchor + period * (k - 1), anchor + period * k, anchor + period * (k + 1)):
+                    if s < self.started:
+                        continue
+                    items.append((s + timedelta(minutes=lg["depart"]), lg, s, s + timedelta(minutes=lg["arrive"])))
+                continue
             if "depart" not in g:
                 continue
             info = bosses.get(g["cycle"])
@@ -1119,7 +1174,8 @@ class BossBot(discord.Client):
         """보스타임 시작 알림에 붙일 '이번 타임 골든 순서' 요약"""
         if start < self.started:
             return ""
-        its = [it for it in self.golden_items(start) if it[2] == start and it[1]["cycle"] == cycle_name]
+        its = [it for it in self.golden_items(start)
+               if abs((it[2] - start).total_seconds()) <= 600 and it[1]["cycle"] == cycle_name]
         if not its:
             return ""
         lines = []
@@ -1323,6 +1379,21 @@ async def golden_cmd(interaction: discord.Interaction):
     lines = [f"🎯 **골든타임** · 기본 {int(GOLDEN_RATE*100)}% · 최근 {GOLDEN_RECENT}건 기준 (시각은 내 기기 시간대)"]
     for g in golden:
         label = f"{g['floor']}F {g['name']}" if g["floor"] else g["name"]
+        if g["cycle"] != "오만의탑":
+            lg = client.learned_golden(g)
+            if not lg:
+                lines.append(f"• **{label}** 📚 {client.learn_status(g)} (학습 끝나면 알림 시작)")
+                continue
+            anchor = datetime.fromtimestamp(lg["anchor_ts"], TZ)
+            period = timedelta(minutes=lg["period"])
+            s = anchor + period * ((now - anchor) // period)
+            while s + timedelta(minutes=lg["depart"]) <= now or s < client.started:
+                s += period
+            d = s + timedelta(minutes=lg["depart"])
+            when = f"{dt(d)} 출발" + (f"→{dt(s + timedelta(minutes=lg['arrive']))}" if lg["travel"] else "")
+            tune = f"{lg['target']}→{lg['eff']}%⬆" if lg["eff"] != lg["target"] else f"{lg['target']}%"
+            lines.append(f"• **{label}** {when} · {tune} · 잡을 확률 {lg['rate']}% · 학습 {lg['n']}건")
+            continue
         if "depart" not in g:
             lines.append(f"• **{label}** 데이터 부족 ({g['n']}건)")
             continue
