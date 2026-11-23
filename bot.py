@@ -60,11 +60,14 @@ HOME_URL = os.environ.get("HOME_URL", "https://l1justice.com/lineage/")   # "Ser
 def parse_server_status(html: str) -> bool | None:
     """홈페이지 HTML 에서 서버 상태 읽기. Online=True, Offline=False, 못 찾으면 None"""
     import re
-    text = re.sub(r"<[^>]+>", " ", html)
-    m = re.search(r"Server\s*Status\s*:\s*(Online|Offline)", text, re.I)
+    import html as _html
+    text = _html.unescape(re.sub(r"<[^>]+>", " ", html))      # &nbsp; 같은 기호도 공백으로
+    text = re.sub(r"\s+", " ", text.replace("\xa0", " "))
+    m = re.search(r"Server\s*Status\s*:?\s*(Online|Offline)", text, re.I) \
+        or re.search(r"서버\s*상태\s*:?\s*(온라인|오프라인|Online|Offline)", text, re.I)
     if not m:
         return None
-    return m.group(1).lower() == "online"
+    return m.group(1).lower() in ("online", "온라인")
 SYNC_TOLERANCE_MIN = 2   # 예측과 실제 시작이 이 분 이상 차이 나면 기준시각 보정
 MASS_FLIP = 45           # 한 번에 이만큼 넘게 ACTIVE 로 바뀌면 = 서버 재시작(보스 일괄 복구)으로 판단
 try:
@@ -648,6 +651,7 @@ class BossBot(discord.Client):
         self.server_online: bool | None = None           # 리니지 서버 온라인 여부
         self.started = datetime.now(TZ)                  # 봇 켜진 시각 (이미 진행중인 타임은 골든 알림 생략)
         self.learn = load_learn()                        # 그 밖의 보스 사이클 학습 기록 (Volume 에 저장)
+        self.status_debug: dict = {}                     # 서버 상태 읽기 결과 (현황판 주소로 확인용)
         self._map_at: datetime | None = None             # 스폰번호→사이클 표를 마지막으로 읽은 시각
 
     async def setup_hook(self):
@@ -698,7 +702,7 @@ class BossBot(discord.Client):
             if sid not in id_cycle or not (r.get("kills") or r.get("regens")):
                 continue
             boss[sid] = {"kills": sorted(r.get("kills", [])), "regen": learn_regen(r), "regen_n": len(r.get("regens", []))}
-        return {"ok": True, "now": now.isoformat(), "server_online": self.server_online, "items": items,
+        return {"ok": True, "now": now.isoformat(), "server_online": self.server_online, "status_debug": self.status_debug, "items": items,
                 "cycles": cycles, "id_cycle": id_cycle, "boss": boss, "min_kills": LEARN_MIN_KILLS}
 
     async def start_status_server(self):
@@ -761,13 +765,25 @@ class BossBot(discord.Client):
         import aiohttp
         # 1) 서버 온라인/오프라인 확인
         status = None
+        dbg = {"at": datetime.now(TZ).isoformat(timespec="seconds")}
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
                 async with s.get(HOME_URL, headers={"User-Agent": "boss-alarm-bot"}) as r:
+                    dbg["http"] = r.status
                     if r.status == 200:
-                        status = parse_server_status(await r.text())
+                        page = await r.text()
+                        status = parse_server_status(page)
+                        if status is None:   # 못 읽었으면 원인 확인용으로 앞부분 조금 남김
+                            import re
+                            plain = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", page))
+                            i = plain.lower().find("status")
+                            dbg["snippet"] = plain[max(0, i - 60): i + 120] if i >= 0 else plain[:200]
+                            dbg["len"] = len(page)
         except Exception as e:
+            dbg["error"] = f"{type(e).__name__}: {e}"[:200]
             log.warning("서버 상태 확인 실패: %s", e)
+        dbg["status"] = status
+        self.status_debug = dbg
         if status is False:
             if self.server_online is not False:
                 self.server_online = False
